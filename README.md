@@ -353,6 +353,59 @@ pen keeps that file from then on rather than clobbering it back to a link.
 
 ## Using the accounts from pi
 
+For the CCS account and usage gadgets inside Pi, install the bundled extension:
+
+```sh
+pi install /absolute/path/to/ccs/pi
+ccs serve
+# In another terminal, keep the cached readings current:
+ccs watch
+```
+
+Restart Pi, or run `/reload`. The extension routes Anthropic and OpenAI Codex
+through CCS at `127.0.0.1:4141` and shows the account, subscription windows,
+reset countdowns and reading age inside the input box’s upper border. It uses
+spare border space after Pi’s Working indicator and overflow hints, truncating
+the account text to the available width. `/ccs status` shows the full details.
+Pi's native footer keeps the model, checkout and context information. `/ccs` opens the account picker,
+`/ccs status` shows cached status, and `/ccs refresh` polls the current account.
+The picker confirms the shared switch, and CCS refuses an exhausted account
+without forcing it. An account change applies to subsequent gateway requests;
+each new Pi turn receives the current account and usage as background context.
+
+The extension adapts Pi's provider authentication so both saved OAuth logins
+and API keys resolve to the gateway credential before the transport builds its
+headers. It leaves `auth.json` intact and keeps Pi's provider request shaping.
+No `models.json` edits are needed with the
+extension. Keep `ccs serve` running while it is enabled; remove the local package
+with `pi remove /absolute/path/to/ccs/pi` and restart Pi to restore direct routing.
+Pi 0.85.1 retains provider registrations across `/reload`; a full restart also
+clears models left by other removed provider packages. Use `pi --continue`
+from the same directory to resume the conversation after restarting.
+It does not implement `ccs pin` or subscribe to Claude's `ccs notify` inbox.
+
+The CCS Pi extension includes request normalization adapted from
+`pi-claude-subscription-connector` 1.0.1 (`@benvargas/pi-claude-code-use` 2.0.0,
+MIT). For Anthropic routed through CCS it aliases extension tools to MCP-style
+names, rewrites Pi-specific system-prompt phrases, and maps tool calls back to
+original tools. It also updates tool names in conversation history and forced
+tool choices. This applies even without a saved Pi OAuth login. Codex and
+Anthropic requests to other URLs are outside this normalization.
+
+Remove a separately installed `pi-claude-subscription-connector` or
+`@benvargas/pi-claude-code-use`; do not stack their rewriting with CCS. Restart
+Pi after removal. Existing `pi-claude-code-use.json` alias configuration and
+`PI_CLAUDE_CODE_USE_*` options remain supported. This reproduces the connector's
+request behavior; Anthropic determines billing and acceptance server-side.
+
+CCS provides the usage display and response warnings itself. The CCS border display
+reads `ccs ls --cached --json` every ten seconds and makes no usage API calls
+while redrawing. Expired readings say `? (refresh)` until the watcher polls.
+The extension preserves visible HTTP failure and extra-usage alerts from the
+gateway's responses.
+
+For a gateway-only setup without the Pi extension:
+
 ```sh
 ccs serve                         # or: ccs serve --port 4141 --rotate agent,work
 ```
@@ -370,7 +423,9 @@ It prints the fragment to paste into pi's `~/.pi/agent/models.json`:
 }
 ```
 
-That is the whole of it. Overriding only `baseUrl` on the built-in provider keeps
+This gateway-only snippet uses a fallback key. In Pi 0.85.1, a saved OAuth login
+or API key takes precedence over it; use the extension above when keeping an
+existing Pi login. Overriding only `baseUrl` on the built-in provider keeps
 every Claude model pi already knows about, and the key is fetched by running the
 command, so nothing secret sits in the file. A client launched from the desktop
 rather than a shell may not have `~/.cargo/bin` on its `PATH`; spell the command
