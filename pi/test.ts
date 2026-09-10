@@ -8,6 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { activeAccount, command } from "./client.ts";
 import { accountText, type Account } from "./display.ts";
 import extension from "./index.ts";
+import { gatewayProvider } from "./routing.ts";
 
 // ── Fixtures ───────────────────────────────────────────────────
 
@@ -29,7 +30,11 @@ const fake = (execute: (args: string[]) => Promise<{ stdout: string; stderr: str
   const pi = {
     exec: (_binary: string, args: string[]) => execute(args),
     on: (event: string, handler: typeof handlers extends Map<string, infer H> ? H : never) => handlers.set(event, handler),
-    registerProvider: (name: string, config: unknown) => providers.set(name, config),
+    registerProvider: (name: string | { id: string }, config: unknown) => {
+      if (typeof name === "string") return providers.set(name, config);
+      return providers.set(name.id, name);
+    },
+    unregisterProvider: (name: string) => providers.delete(name),
     registerCommand: (name: string, spec: typeof commands extends Map<string, infer H> ? H : never) => commands.set(name, spec),
   } as unknown as ExtensionAPI;
   return { pi, handlers, commands, providers };
@@ -88,7 +93,7 @@ test("CLI failure is surfaced without treating stderr as valid usage", async () 
 
 // ── Pi integration ─────────────────────────────────────────────
 
-test("gateway headers replace saved credentials; account changes reach next turn", async () => {
+test("startup installs gateway authentication; account changes reach next turn", async () => {
   const responses = [account, { ...account, slug: "next", email: "next@example.com" }];
   const { pi, handlers, providers } = fake(args => {
     if (args[0] === "serve") return okay(`test-key-${args[2]}`);
@@ -96,18 +101,16 @@ test("gateway headers replace saved credentials; account changes reach next turn
   });
   const ctx = {
     hasUI: false, model: { provider: "anthropic" },
+    modelRegistry: { getProvider: (id: string) => ({ id, models: [], auth: {} }) },
     ui: { notify: (message: string) => assert.fail(message) },
   } as unknown as ExtensionContext;
   extension(pi);
   await handlers.get("session_start")!({}, ctx);
-  assert.deepEqual(providers.get("anthropic"), { baseUrl: "http://127.0.0.1:4141", apiKey: "!ccs serve --key claude" });
-  assert.deepEqual(providers.get("openai-codex"), { baseUrl: "http://127.0.0.1:4141/backend-api", apiKey: "!ccs serve --key codex" });
-  const headers = { authorization: "Bearer saved-login", "X-Api-Key": "saved-key", "anthropic-beta": "oauth", Authorization: "saved" };
-  await handlers.get("before_provider_headers")!({ headers }, ctx);
-  assert.equal(headers.Authorization, "Bearer test-key-claude");
-  assert.equal(headers.authorization, null);
-  assert.equal(headers["X-Api-Key"], null);
-  assert.equal(headers["anthropic-beta"], "oauth");
+  const routed = providers.get("openai-codex") as ReturnType<typeof gatewayProvider>;
+  const result = await routed.auth.apiKey!.resolve({ ctx: {} as never, signal: new AbortController().signal });
+  assert.equal(result?.auth.apiKey, "test-key-codex");
+  assert.equal(result?.auth.baseUrl, "http://127.0.0.1:4141/backend-api");
+  assert.equal(handlers.has("before_provider_headers"), false);
   const first = await handlers.get("before_agent_start")!({}, ctx);
   const second = await handlers.get("before_agent_start")!({}, ctx);
   assert.match(JSON.stringify(first), /test@example.com/);

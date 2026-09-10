@@ -6,8 +6,8 @@
   "description": "CCS accounts, subscription usage and gateway routing inside Pi",
   "pi": { "extensions": ["./index.ts"] },
   "scripts": {
-    "test": "node --experimental-strip-types --test test.ts",
-    "typecheck": "tsc --noEmit --strict --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck index.ts test.ts"
+    "test": "node --experimental-strip-types --test test.ts routing.test.ts",
+    "typecheck": "tsc --noEmit --strict --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck index.ts test.ts routing.test.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",

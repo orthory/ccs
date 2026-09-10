@@ -1,11 +1,12 @@
 // A Pi session routes through CCS and displays the account that CCS will use.
-// Gateway headers replace request credentials without changing auth.json.
+// Gateway authentication replaces request credentials without changing auth.json.
 // The native footer continues to own model, checkout and context information.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { accounts, activeAccount, command } from "./client.ts";
 import { accountText, providerFor, type Account, type Provider } from "./display.ts";
+import { connect, routes } from "./routing.ts";
 
 // ── Status and commands ────────────────────────────────────────
 
@@ -60,25 +61,15 @@ export default (pi: ExtensionAPI): void => {
   const lifetime = new AbortController();
   const timers = new Set<ReturnType<typeof setInterval>>();
 
-  pi.registerProvider("anthropic", { baseUrl: "http://127.0.0.1:4141", apiKey: "!ccs serve --key claude" });
-  pi.registerProvider("openai-codex", { baseUrl: "http://127.0.0.1:4141/backend-api", apiKey: "!ccs serve --key codex" });
-
-  pi.on("before_provider_headers", (event, ctx) => {
-    const provider = providerFor(ctx.model?.provider);
-    if (!provider) return;
-    return Promise.resolve()
-      .then(() => command(pi, ["serve", "--key", provider], lifetime.signal))
-      .then(key => {
-        // Header names are case-insensitive; remove every previous spelling.
-        Object.keys(event.headers).forEach(name => {
-          const credentialHeader = ["authorization", "x-api-key"].includes(name.toLowerCase());
-          if (credentialHeader) event.headers[name] = null;
-        });
-        event.headers.Authorization = `Bearer ${key}`;
-      });
+  routes.forEach(route => {
+    pi.registerProvider(route.provider, {
+      baseUrl: route.baseUrl,
+      apiKey: `!ccs serve --key ${route.accountProvider}`,
+    });
   });
 
   pi.on("session_start", (_event, ctx) => Promise.resolve()
+    .then(() => connect(pi, ctx, lifetime.signal))
     .then(() => {
       if (!ctx.hasUI) return;
       // Match the existing Claude status line's ten-second cache redraw.

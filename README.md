@@ -371,9 +371,10 @@ The picker confirms the shared switch, and CCS refuses an exhausted account
 without forcing it. An account change applies to subsequent gateway requests;
 each new Pi turn receives the current account and usage as background context.
 
-The extension uses Pi 0.85.1's provider-header hook so a saved Pi OAuth login
-cannot override the gateway credential. It leaves `auth.json` intact and keeps
-Pi's provider request shaping. No `models.json` edits are needed with the
+The extension adapts Pi's provider authentication so both saved OAuth logins
+and API keys resolve to the gateway credential before the transport builds its
+headers. It leaves `auth.json` intact and keeps Pi's provider request shaping.
+No `models.json` edits are needed with the
 extension. Keep `ccs serve` running while it is enabled; remove the local package
 with `pi remove /absolute/path/to/ccs/pi` and reload to restore direct routing.
 It does not implement `ccs pin` or subscribe to Claude's `ccs notify` inbox.
