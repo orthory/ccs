@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { accounts, activeAccount, command } from "./client.ts";
 import { accountText, providerFor, type Account, type Provider } from "./display.ts";
 import { connect, routes } from "./routing.ts";
+import { installSubscription } from "./subscription.ts";
 
 // ── Status and commands ────────────────────────────────────────
 
@@ -58,6 +59,7 @@ const chooseAccount = (pi: ExtensionAPI, ctx: ExtensionContext, provider: Provid
 // ── Extension lifecycle ─────────────────────────────────────────
 
 export default (pi: ExtensionAPI): void => {
+  installSubscription(pi);
   const lifetime = new AbortController();
   const timers = new Set<ReturnType<typeof setInterval>>();
 

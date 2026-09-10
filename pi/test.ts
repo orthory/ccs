@@ -29,7 +29,13 @@ const fake = (execute: (args: string[]) => Promise<{ stdout: string; stderr: str
   const providers = new Map<string, unknown>();
   const pi = {
     exec: (_binary: string, args: string[]) => execute(args),
-    on: (event: string, handler: typeof handlers extends Map<string, infer H> ? H : never) => handlers.set(event, handler),
+    on: (event: string, handler: typeof handlers extends Map<string, infer H> ? H : never) => {
+      const previous = handlers.get(event);
+      handlers.set(event, (value, ctx) => Promise.resolve().then(() => previous?.(value, ctx)).then(() => handler(value, ctx)));
+    },
+    getAllTools: () => [],
+    getActiveTools: () => [],
+    setActiveTools: () => {},
     registerProvider: (name: string | { id: string }, config: unknown) => {
       if (typeof name === "string") return providers.set(name, config);
       return providers.set(name.id, name);

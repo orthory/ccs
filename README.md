@@ -382,9 +382,21 @@ clears models left by other removed provider packages. Use `pi --continue`
 from the same directory to resume the conversation after restarting.
 It does not implement `ccs pin` or subscribe to Claude's `ccs notify` inbox.
 
-If `pi-claude-subscription-connector` is installed, keep its subscription guard
-but disable its separate usage footer with `pi config`: that footer polls Pi's
-saved login, which can differ from the account CCS is routing. The CCS widget
+The CCS Pi extension includes request normalization adapted from
+`pi-claude-subscription-connector` 1.0.1 (`@benvargas/pi-claude-code-use` 2.0.0,
+MIT). For Anthropic routed through CCS it aliases extension tools to MCP-style
+names, rewrites Pi-specific system-prompt phrases, and maps tool calls back to
+original tools. It also updates tool names in conversation history and forced
+tool choices. This applies even without a saved Pi OAuth login. Codex and
+Anthropic requests to other URLs are outside this normalization.
+
+Remove a separately installed `pi-claude-subscription-connector` or
+`@benvargas/pi-claude-code-use`; do not stack their rewriting with CCS. Restart
+Pi after removal. Existing `pi-claude-code-use.json` alias configuration and
+`PI_CLAUDE_CODE_USE_*` options remain supported. This reproduces the connector's
+request behavior; Anthropic determines billing and acceptance server-side.
+
+CCS provides the usage display and response warnings itself. The CCS widget
 reads `ccs ls --cached --json` every ten seconds and makes no usage API calls
 while redrawing. Expired readings say `? (refresh)` until the watcher polls.
 The extension preserves visible HTTP failure and extra-usage alerts from the
