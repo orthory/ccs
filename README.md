@@ -364,8 +364,10 @@ ccs watch
 
 Restart Pi, or run `/reload`. The extension routes Anthropic and OpenAI Codex
 through CCS at `127.0.0.1:4141` and shows the account, subscription windows,
-reset countdowns and reading age above the prompt. Pi's native footer keeps
-the model, checkout and context information. `/ccs` opens the account picker,
+reset countdowns and reading age inside the input box’s upper border. It uses
+spare border space after Pi’s Working indicator and overflow hints, truncating
+the account text to the available width. `/ccs status` shows the full details.
+Pi's native footer keeps the model, checkout and context information. `/ccs` opens the account picker,
 `/ccs status` shows cached status, and `/ccs refresh` polls the current account.
 The picker confirms the shared switch, and CCS refuses an exhausted account
 without forcing it. An account change applies to subsequent gateway requests;
@@ -396,7 +398,7 @@ Pi after removal. Existing `pi-claude-code-use.json` alias configuration and
 `PI_CLAUDE_CODE_USE_*` options remain supported. This reproduces the connector's
 request behavior; Anthropic determines billing and acceptance server-side.
 
-CCS provides the usage display and response warnings itself. The CCS widget
+CCS provides the usage display and response warnings itself. The CCS border display
 reads `ccs ls --cached --json` every ten seconds and makes no usage API calls
 while redrawing. Expired readings say `? (refresh)` until the watcher polls.
 The extension preserves visible HTTP failure and extra-usage alerts from the

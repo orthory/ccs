@@ -3,8 +3,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { accountBorder, installAccountBorder } from "./border.ts";
 import { activeAccount, command } from "./client.ts";
 import { accountText, type Account } from "./display.ts";
 import extension from "./index.ts";
@@ -167,4 +170,45 @@ test("gateway usage alerts preserve overage and HTTP failures; healthy response 
   await handlers.get("after_provider_response")!({ status: 200, headers: {} }, ctx);
   assert.deepEqual(statuses, ["CCS · extra usage", "CCS · HTTP 400", undefined]);
   assert.equal(notices.length, 1);
+});
+
+
+test("account text shares the upper border with Working and overflow hints", () => {
+  for (const prefix of ["── ", "── ⠋ Working ─", "── ⠋ Working ───── ↑ 2 more ─"]) {
+    for (const width of [50, 100]) {
+      const native = prefix + "─".repeat(width - visibleWidth(prefix));
+      const result = accountBorder(native, "CCS · 이름@example.com · max20x │ 5h 5% · wk 38%");
+      assert.equal(visibleWidth(result), width);
+      assert.ok(stripTerminalSequences(result).startsWith(prefix));
+      assert.match(result, /CCS/);
+      assert.equal(result.includes("\n"), false);
+      assert.equal(accountBorder(native, undefined), native);
+    }
+  }
+  assert.equal(accountBorder("── ⠋ Working ─", "CCS · account"), "── ⠋ Working ─");
+});
+
+test("border adapter updates the real editor, preserves input and restores on unload", () => {
+  const redraws: number[] = [];
+  type Args = ConstructorParameters<typeof CustomEditor>;
+  const editor = new CustomEditor(
+    { requestRender: () => redraws.push(1) } as unknown as Args[0],
+    { borderColor: (text: string) => text } as unknown as Args[1],
+    { matches: () => false } as unknown as Args[2],
+    { embedWorkingStatus: true },
+  );
+  const input = CustomEditor.prototype.handleInput;
+  const view = editor as unknown as { renderTopBorder(width: number, hidden: number): string };
+  const original = view.renderTopBorder(100, 0);
+  const border = installAccountBorder();
+  assert.equal(view.renderTopBorder(100, 0), original);
+  border.set("CCS · first@example.com");
+  assert.match(view.renderTopBorder(100, 0), /CCS · first@example.com/);
+  assert.ok(redraws.length > 0);
+  border.set("CCS · next@example.com");
+  assert.match(view.renderTopBorder(100, 0), /next@example.com/);
+  assert.doesNotMatch(view.renderTopBorder(100, 0), /first@example.com/);
+  assert.equal(CustomEditor.prototype.handleInput, input);
+  border.dispose();
+  assert.equal(view.renderTopBorder(100, 0), original);
 });

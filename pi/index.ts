@@ -4,6 +4,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { installAccountBorder, type AccountBorder } from "./border.ts";
 import { accounts, activeAccount, command } from "./client.ts";
 import { accountText, providerFor, type Account, type Provider } from "./display.ts";
 import { connect, routes } from "./routing.ts";
@@ -11,15 +12,15 @@ import { installSubscription } from "./subscription.ts";
 
 // ── Status and commands ────────────────────────────────────────
 
-const show = (ctx: ExtensionContext, account: Account): void => {
+const show = (ctx: ExtensionContext, account: Account, border: AccountBorder): void => {
   const text = accountText(account, Date.now(), (color, value) => ctx.ui.theme.fg(color, value));
-  ctx.ui.setWidget("ccs", [`CCS · ${text}`]);
+  border.set(ctx.ui.theme.fg("muted", `CCS · ${text}`));
 };
 
-const refresh = (pi: ExtensionAPI, ctx: ExtensionContext, signal: AbortSignal): Promise<void> => {
+const refresh = (pi: ExtensionAPI, ctx: ExtensionContext, signal: AbortSignal, border: AccountBorder): Promise<void> => {
   const provider = providerFor(ctx.model?.provider);
   if (!provider) {
-    ctx.ui.setWidget("ccs", undefined);
+    border.set();
     return Promise.resolve();
   }
   return Promise.resolve()
@@ -27,12 +28,12 @@ const refresh = (pi: ExtensionAPI, ctx: ExtensionContext, signal: AbortSignal): 
     .then(account => {
       const obsolete = signal.aborted || provider !== providerFor(ctx.model?.provider);
       if (obsolete) return;
-      if (!account) return ctx.ui.setWidget("ccs", ["CCS · no active account"]);
-      show(ctx, account);
+      if (!account) return border.set("CCS · no active account");
+      show(ctx, account, border);
     })
     .catch(error => {
       if (signal.aborted) return;
-      ctx.ui.setWidget("ccs", [ctx.ui.theme.fg("error", `CCS · ${String(error)}`)]);
+      border.set(ctx.ui.theme.fg("error", `CCS · ${String(error)}`));
     });
 };
 
@@ -60,6 +61,7 @@ const chooseAccount = (pi: ExtensionAPI, ctx: ExtensionContext, provider: Provid
 
 export default (pi: ExtensionAPI): void => {
   installSubscription(pi);
+  const border: AccountBorder = { set: () => {}, dispose: () => {} };
   const lifetime = new AbortController();
   const timers = new Set<ReturnType<typeof setInterval>>();
 
@@ -74,16 +76,19 @@ export default (pi: ExtensionAPI): void => {
     .then(() => connect(pi, ctx, lifetime.signal))
     .then(() => {
       if (!ctx.hasUI) return;
+      border.dispose();
+      Object.assign(border, installAccountBorder());
+      ctx.ui.setWidget("ccs", undefined);
       // Match the existing Claude status line's ten-second cache redraw.
-      const timer = setInterval(() => { void refresh(pi, ctx, lifetime.signal); }, 10_000);
+      const timer = setInterval(() => { void refresh(pi, ctx, lifetime.signal, border); }, 10_000);
       timer.unref();
       timers.add(timer);
-      return refresh(pi, ctx, lifetime.signal);
+      return refresh(pi, ctx, lifetime.signal, border);
     }));
 
   pi.on("model_select", (_event, ctx) => {
     ctx.ui.setStatus("ccs-response", undefined);
-    return refresh(pi, ctx, lifetime.signal);
+    return refresh(pi, ctx, lifetime.signal, border);
   });
   pi.on("after_provider_response", (event, ctx) => {
     if (!providerFor(ctx.model?.provider)) return;
@@ -99,7 +104,7 @@ export default (pi: ExtensionAPI): void => {
     }
     ctx.ui.setStatus("ccs-response", undefined);
   });
-  pi.on("agent_end", (_event, ctx) => refresh(pi, ctx, lifetime.signal));
+  pi.on("agent_end", (_event, ctx) => refresh(pi, ctx, lifetime.signal, border));
   pi.on("before_agent_start", (_event, ctx) => {
     const provider = providerFor(ctx.model?.provider);
     if (!provider) return;
@@ -118,6 +123,7 @@ export default (pi: ExtensionAPI): void => {
       });
   });
   pi.on("session_shutdown", () => {
+    border.dispose();
     lifetime.abort();
     timers.forEach(clearInterval);
     timers.clear();
@@ -136,7 +142,7 @@ export default (pi: ExtensionAPI): void => {
           default: throw new Error("Use /ccs, /ccs refresh, or /ccs status.");
         }
       })
-      .then(() => refresh(pi, ctx, lifetime.signal))
+      .then(() => refresh(pi, ctx, lifetime.signal, border))
       .catch(error => { ctx.ui.notify(String(error), "error"); }),
   });
 };
