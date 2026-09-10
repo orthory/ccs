@@ -353,6 +353,41 @@ pen keeps that file from then on rather than clobbering it back to a link.
 
 ## Using the accounts from pi
 
+For the CCS account and usage gadgets inside Pi, install the bundled extension:
+
+```sh
+pi install /absolute/path/to/ccs/pi
+ccs serve
+# In another terminal, keep the cached readings current:
+ccs watch
+```
+
+Restart Pi, or run `/reload`. The extension routes Anthropic and OpenAI Codex
+through CCS at `127.0.0.1:4141` and shows the account, subscription windows,
+reset countdowns and reading age above the prompt. Pi's native footer keeps
+the model, checkout and context information. `/ccs` opens the account picker,
+`/ccs status` shows cached status, and `/ccs refresh` polls the current account.
+The picker confirms the shared switch, and CCS refuses an exhausted account
+without forcing it. An account change applies to subsequent gateway requests;
+each new Pi turn receives the current account and usage as background context.
+
+The extension uses Pi 0.85.1's provider-header hook so a saved Pi OAuth login
+cannot override the gateway credential. It leaves `auth.json` intact and keeps
+Pi's provider request shaping. No `models.json` edits are needed with the
+extension. Keep `ccs serve` running while it is enabled; remove the local package
+with `pi remove /absolute/path/to/ccs/pi` and reload to restore direct routing.
+It does not implement `ccs pin` or subscribe to Claude's `ccs notify` inbox.
+
+If `pi-claude-subscription-connector` is installed, keep its subscription guard
+but disable its separate usage footer with `pi config`: that footer polls Pi's
+saved login, which can differ from the account CCS is routing. The CCS widget
+reads `ccs ls --cached --json` every ten seconds and makes no usage API calls
+while redrawing. Expired readings say `? (refresh)` until the watcher polls.
+The extension preserves visible HTTP failure and extra-usage alerts from the
+gateway's responses.
+
+For a gateway-only setup without the Pi extension:
+
 ```sh
 ccs serve                         # or: ccs serve --port 4141 --rotate agent,work
 ```

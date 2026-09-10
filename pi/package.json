@@ -1,0 +1,17 @@
+{
+  "name": "ccs-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CCS accounts, subscription usage and gateway routing inside Pi",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test.ts",
+    "typecheck": "tsc --noEmit --strict --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck index.ts test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
