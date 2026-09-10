@@ -370,7 +370,9 @@ It prints the fragment to paste into pi's `~/.pi/agent/models.json`:
 }
 ```
 
-That is the whole of it. Overriding only `baseUrl` on the built-in provider keeps
+This gateway-only snippet uses a fallback key. In Pi 0.85.1, a saved OAuth login
+or API key takes precedence over it; use the extension above when keeping an
+existing Pi login. Overriding only `baseUrl` on the built-in provider keeps
 every Claude model pi already knows about, and the key is fetched by running the
 command, so nothing secret sits in the file. A client launched from the desktop
 rather than a shell may not have `~/.cargo/bin` on its `PATH`; spell the command
