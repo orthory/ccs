@@ -376,7 +376,10 @@ and API keys resolve to the gateway credential before the transport builds its
 headers. It leaves `auth.json` intact and keeps Pi's provider request shaping.
 No `models.json` edits are needed with the
 extension. Keep `ccs serve` running while it is enabled; remove the local package
-with `pi remove /absolute/path/to/ccs/pi` and reload to restore direct routing.
+with `pi remove /absolute/path/to/ccs/pi` and restart Pi to restore direct routing.
+Pi 0.85.1 retains provider registrations across `/reload`; a full restart also
+clears models left by other removed provider packages. Use `pi --continue`
+from the same directory to resume the conversation after restarting.
 It does not implement `ccs pin` or subscribe to Claude's `ccs notify` inbox.
 
 If `pi-claude-subscription-connector` is installed, keep its subscription guard
