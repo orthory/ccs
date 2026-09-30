@@ -23,6 +23,19 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedOut {
+    pub relogin: &'static str,
+}
+
+impl fmt::Display for SignedOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "these credentials no longer refresh; {}", self.relogin)
+    }
+}
+
+impl std::error::Error for SignedOut {}
+
 // ── providers ────────────────────────────────────────────────────────────────
 
 /// Whose account this is. Each provider has a live slot of its own — Claude

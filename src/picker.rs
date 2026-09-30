@@ -174,7 +174,7 @@ pub fn run(accounts: &mut dyn Accounts, verb: Verb) -> Result<Outcome> {
         return Ok(Outcome::Quit);
     }
 
-    let mut at = Some(0);
+    let mut at = table.selectable().first().copied();
     let mut mode = Mode::Browsing;
     let mut polled = Instant::now();
     let mut attempted = Instant::now();
@@ -224,16 +224,18 @@ pub fn run(accounts: &mut dyn Accounts, verb: Verb) -> Result<Outcome> {
                 continue;
             }
 
-            match decide(key, at, table.len()) {
+            let order = table.selectable();
+            let position = at.and_then(|at| order.iter().position(|&index| index == at));
+            match decide(key, position, order.len()) {
                 Step::Move(next) => {
-                    at = Some(next);
+                    at = order.get(next).copied();
                     mode = Mode::Browsing;
                 }
                 Step::Unselect => {
                     at = None;
                     mode = Mode::Browsing;
                 }
-                Step::Confirm(target) => mode = Mode::Confirming(target),
+                Step::Confirm(position) => mode = Mode::Confirming(order[position]),
                 Step::Refresh => poll_now = true,
                 Step::Routes => {
                     if matches!(verb, Verb::Switch) {
@@ -286,13 +288,17 @@ fn repoll(
     *attempted = Instant::now();
     match accounts.poll() {
         Ok(next) => {
-            *at = at.map(|at| at.min(next.len().saturating_sub(1)));
+            *at = at.and_then(|at| nearest(&next.selectable(), at));
             *table = next;
             *polled = Instant::now();
             Mode::Browsing
         }
         Err(e) => Mode::Note(format!("refresh failed: {e}")),
     }
+}
+
+fn nearest(order: &[usize], at: usize) -> Option<usize> {
+    order.iter().copied().find(|&index| index >= at).or_else(|| order.last().copied())
 }
 
 enum Step {
@@ -447,6 +453,14 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn a_poll_keeps_the_selection_on_a_row_that_can_still_be_chosen() {
+        assert_eq!(nearest(&[0, 2, 3], 2), Some(2));
+        assert_eq!(nearest(&[0, 2, 3], 1), Some(2));
+        assert_eq!(nearest(&[0, 2], 5), Some(2));
+        assert_eq!(nearest(&[], 0), None);
     }
 
     #[test]

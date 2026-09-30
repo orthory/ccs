@@ -259,6 +259,18 @@ The Codex section shows its quota windows and model availability:
    5 you+alt@example.com  codex pro  —                 ██▌░  65% 2d11h   back 1h30m
 ```
 
+Accounts whose provider no longer accepts their login, usually because the
+plan behind them ended, move to a dimmed `Signed out` section at the bottom:
+
+```text
+  Signed out  `ccs add` signs these in again
+   6 old@example.com      max20x     Claude Code
+```
+
+They keep their numbers, so `ccs rm 6` still removes one, but the picker skips
+them and `ccs use` refuses them until `ccs add` logs them in again. `--json`
+marks them `"signed_out": true`.
+
 Additional pool names and model IDs come from the API. Pool rows belong to the
 account above them; only accounts are selectable. Switching to an account with
 an unavailable model prompts for confirmation, just as a spent quota does.
@@ -444,7 +456,8 @@ open /Applications/ccs.app
 ```
 
 One window on every platform: every account with its bars and reset times,
-click one to switch, and a spent account asks first. Below them the two
+click one to switch, and a spent account asks first. Signed-out accounts sit
+in a dimmed group of their own with no way to switch to them. Below them the two
 switches. **Gateway** serves the API on the port you set. **Rotate
 automatically** hands the watcher a pool of the accounts you tick, and
 **Notifications** turns its `session-high`, `session-reset`, `weekly-reset`

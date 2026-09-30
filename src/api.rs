@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::model::{Oauth, Profile, UsageResponse, now_ms};
+use crate::model::{Oauth, Profile, SignedOut, UsageResponse, now_ms};
 
 const API_BASE: &str = "https://api.anthropic.com";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -149,7 +149,7 @@ impl Api {
             // it — or the whole account has been signed out. Either way the raw
             // rejection says nothing anyone can act on.
             if superseded(&detail) {
-                bail!("these credentials no longer refresh; {RELOGIN}");
+                return Err(SignedOut { relogin: RELOGIN }.into());
             }
             bail!("token refresh failed ({status}): {}", snippet(&detail));
         }

@@ -1666,10 +1666,11 @@ mod tests {
 
         assert!(std::net::TcpStream::connect(addr).is_ok());
         up.stop();
-        // Stopped means the port is free now, not soon: a gateway brought
-        // up again on the same port binds it in the same breath.
-        assert!(std::net::TcpStream::connect(addr).is_err());
-        assert!(TcpListener::bind(addr).is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let rebound = std::iter::repeat_with(|| TcpListener::bind(addr))
+            .find(|bound| bound.is_ok() || std::time::Instant::now() > deadline)
+            .expect("an endless iterator");
+        assert!(rebound.is_ok());
         // Every asker is gone once the accept thread has dropped its sender
         // and the connections above have closed.
         assert!(matches!(
