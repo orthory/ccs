@@ -71,15 +71,25 @@ impl Screen {
     pub(crate) fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("entering raw mode")?;
         let screen = Self;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
-            .context("entering alternate screen")?;
+        execute!(
+            io::stdout(),
+            terminal::EnterAlternateScreen,
+            terminal::DisableLineWrap,
+            cursor::Hide
+        )
+        .context("entering alternate screen")?;
         Ok(screen)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            cursor::Show,
+            terminal::EnableLineWrap,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
