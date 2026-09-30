@@ -97,6 +97,7 @@ mod tests {
             polled_at: "2026-09-07T00:00:00Z".into(),
             polled: "09:00".into(),
             note: String::new(),
+            signed_out: false,
             limits: vec![limit("session", session), limit("weekly", 37.0), limit("Fable", 62.0)],
         }
     }

@@ -221,7 +221,8 @@ impl Dashboard {
                 this.set_models(claude, codex);
                 match accounts {
                     Ok(accounts) => {
-                        let failed = accounts.iter().filter(|a| !a.note.is_empty()).count();
+                        let failed =
+                            accounts.iter().filter(|a| !a.note.is_empty() && !a.signed_out).count();
                         this.set_accounts(accounts);
                         this.status = if failed == 0 {
                             if this.model_error.is_empty() {
@@ -332,7 +333,7 @@ impl Dashboard {
         let mut content = div().v_flex().gap_4();
         for provider in ["claude", "codex"] {
             let accounts: Vec<_> =
-                self.accounts.iter().filter(|a| a.provider == provider).collect();
+                self.accounts.iter().filter(|a| a.provider == provider && !a.signed_out).collect();
             let mut group = div().v_flex().child(
                 div()
                     .flex()
@@ -461,7 +462,41 @@ impl Dashboard {
             }
             content = content.child(group);
         }
-        content
+        let signed_out: Vec<_> = self.accounts.iter().filter(|a| a.signed_out).collect();
+        if signed_out.is_empty() {
+            return content;
+        }
+        let mut group = div().v_flex().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pb_2()
+                .child(div().font_semibold().child("Signed out"))
+                .child(muted(signed_out.len().to_string()))
+                .child(muted("`ccs add` signs these in again").text_xs()),
+        );
+        for a in signed_out {
+            let provider = if a.provider == "claude" { "Claude" } else { "Codex" };
+            group = group.child(
+                row()
+                    .id(SharedString::from(format!("signed-out-{}", a.slug)))
+                    .test_support()
+                    .items_center()
+                    .gap_5()
+                    .child(
+                        div()
+                            .v_flex()
+                            .w(px(210.))
+                            .flex_shrink_0()
+                            .gap_1()
+                            .child(muted(a.email.clone()))
+                            .child(muted(format!("{} · {provider}", a.plan)).text_xs()),
+                    )
+                    .when(a.active, |row| row.child(muted("In use").text_xs())),
+            );
+        }
+        content.child(group)
     }
 
     fn set_models(
@@ -1186,6 +1221,33 @@ mod ui_tests {
             cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
             dashboard.update(cx, |view, _| assert_eq!(view.scroll.max_offset().y, px(0.)));
         }
+    }
+
+    #[gpui_kit::test]
+    fn signed_out_accounts_sit_apart_with_no_way_to_switch_to_them(cx: &mut TestAppContext) {
+        use gpui_kit::SharedString;
+        cx.update(gpui_kit::init);
+        let mut dashboard = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| Dashboard::new(window, cx));
+            dashboard = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let dashboard = dashboard.unwrap();
+        let (gone, kept) = dashboard.update(cx, |view, cx| {
+            view.accounts[0].signed_out = true;
+            view.accounts[0].limits.clear();
+            cx.notify();
+            (view.accounts[0].slug.clone(), view.accounts[1].slug.clone())
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from(format!("signed-out-{gone}"))).is_some());
+            assert!(window.try_find(SharedString::from(format!("switch-{gone}"))).is_none());
+            assert!(window.try_find(SharedString::from(format!("switch-{kept}"))).is_some());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

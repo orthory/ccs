@@ -39,6 +39,7 @@ pub struct Account {
     pub polled: String,
     /// Why there is no reading, when there is none.
     pub note: String,
+    pub signed_out: bool,
     pub limits: Vec<Limit>,
 }
 
@@ -503,7 +504,8 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
                     .map_or(-1.0, |l| l.percent),
                 polled_at: reading.polled_at.clone().unwrap_or_default(),
                 polled: reading.polled_at.as_deref().map(|at| clock(at, now)).unwrap_or_default(),
-                note: entry.usage.as_ref().err().cloned().unwrap_or_default(),
+                note: entry.usage.as_ref().err().map(ToString::to_string).unwrap_or_default(),
+                signed_out: entry.signed_out(),
                 limits,
             }
         })
@@ -560,6 +562,7 @@ pub mod fixture {
             polled_at: "2026-09-07T00:00:00Z".into(),
             polled: "09:00".into(),
             note: String::new(),
+            signed_out: false,
             limits,
         }
     }
@@ -671,7 +674,7 @@ mod tests {
                 email: format!("{slug}@x.com"),
                 plan: "max20x".into(),
                 active,
-                usage: limits.map(Into::into),
+                usage: limits.map(Into::into).map_err(Into::into),
             },
             polled_at: Some("2026-09-07T00:00:00Z".into()),
         }
@@ -746,6 +749,15 @@ mod tests {
         assert_eq!(account.session_percent, -1.0);
         assert!(account.limits.is_empty());
         assert!(!account.spent);
+    }
+
+    #[test]
+    fn a_signed_out_account_is_marked_so_the_page_can_set_it_apart() {
+        let mut row = cached("gone", false, Ok(vec![]));
+        row.entry.usage = Err(ccs::render::Unread::SignedOut);
+        let account = &accounts_of(&[row], Timestamp::now())[0];
+        assert!(account.signed_out);
+        assert!(account.limits.is_empty());
     }
 
     /// The clock says the time today and the date otherwise, in the zone

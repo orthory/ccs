@@ -20,13 +20,13 @@ use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
 use crate::model::{
-    Account, CredsFile, Limit, ModelAvailability, Oauth, Provider, Stashed, UsageResponse,
-    plan_label,
+    Account, CredsFile, Limit, ModelAvailability, Oauth, Provider, SignedOut, Stashed,
+    UsageResponse, plan_label,
 };
 use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
-use crate::render::{self, Entry, Style, Table, Verb};
+use crate::render::{self, Entry, Style, Table, Unread, Verb};
 use crate::serve::{self, Grant};
 use crate::stash::{self, Stash};
 use crate::usage;
@@ -127,7 +127,7 @@ struct Probe {
     /// persist it: the refresh may have rotated the refresh token, and a
     /// rotated token that is not written down costs an interactive re-login.
     refreshed: Option<Oauth>,
-    usage: Result<UsageResponse, String>,
+    usage: Result<UsageResponse, Unread>,
 }
 
 /// Ask one account for its limits, refreshing its access token first if the
@@ -137,11 +137,18 @@ fn probe(apis: Apis, entry: &Stashed) -> Probe {
     let provider = entry.account.provider;
     let refreshed = match freshen(apis, provider, &entry.account.oauth) {
         Ok(refreshed) => refreshed,
-        Err(e) => return Probe { slug, refreshed: None, usage: Err(describe(&e)) },
+        Err(e) => return Probe { slug, refreshed: None, usage: Err(unread(&e)) },
     };
     let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
-    let usage = read_usage(apis, provider, oauth).map_err(|e| describe(&e));
+    let usage = read_usage(apis, provider, oauth).map_err(|e| unread(&e));
     Probe { slug, refreshed, usage }
+}
+
+fn unread(error: &anyhow::Error) -> Unread {
+    match error.chain().any(|cause| cause.is::<SignedOut>()) {
+        true => Unread::SignedOut,
+        false => Unread::Failed(describe(error)),
+    }
 }
 
 /// What an account has left, asked of its provider.
@@ -342,12 +349,9 @@ fn retry_lost_refreshes(
     probes: &mut [Probe],
     live: &Live,
 ) -> Result<()> {
-    let unrefreshed = |accounts: &[Stashed], slug: &str| {
-        accounts.iter().any(|a| a.slug == slug && a.account.oauth.needs_refresh())
-    };
     let lost: Vec<String> = probes
         .iter()
-        .filter(|p| p.usage.is_err() && unrefreshed(accounts, &p.slug))
+        .filter(|p| matches!(p.usage, Err(Unread::SignedOut)))
         .map(|p| p.slug.clone())
         .collect();
     if lost.is_empty() {
@@ -371,10 +375,21 @@ fn retry_lost_refreshes(
 /// is worth more than absent, and the stamp on it says how stale.
 fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
     for probe in probes {
-        let Ok(usage) = &probe.usage else { continue };
-        ctx.usage.record(&probe.slug, usage)?;
+        match &probe.usage {
+            Ok(usage) => ctx.usage.record(&probe.slug, usage)?,
+            Err(Unread::SignedOut) => ctx.usage.record_signed_out(&probe.slug)?,
+            Err(Unread::Failed(_)) => {}
+        }
     }
     Ok(())
+}
+
+fn standing(reading: Option<usage::Reading>) -> (Result<UsageResponse, Unread>, Option<String>) {
+    match reading {
+        Some(reading) if reading.signed_out => (Err(Unread::SignedOut), Some(reading.polled_at)),
+        Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
+        None => (Err("not polled yet; `ccs watch` polls".into()), None),
+    }
 }
 
 /// Which stashed account of `provider` its live slot holds.
@@ -499,7 +514,7 @@ pub fn refresh_readings(ctx: &Ctx) -> Result<Vec<Cached>> {
         .entries()
         .iter()
         .map(|entry| {
-            let polled_at = if entry.usage.is_ok() {
+            let polled_at = if entry.usage.is_ok() || entry.signed_out() {
                 ctx.usage.read(&entry.slug)?.map(|reading| reading.polled_at)
             } else {
                 None
@@ -569,11 +584,7 @@ pub fn readings(ctx: &Ctx) -> Result<Vec<Cached>> {
         .iter()
         .map(|account| {
             let live = ctx.stash.active(account.account.provider);
-            let reading = ctx.usage.read(&account.slug)?;
-            let (usage, polled_at) = match reading {
-                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
-                None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
-            };
+            let (usage, polled_at) = standing(ctx.usage.read(&account.slug)?);
             let entry = Entry {
                 provider: account.account.provider,
                 slug: account.slug.clone(),
@@ -643,11 +654,7 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
             identified.as_ref().and_then(|slug| accounts.iter().find(|a| &a.slug == slug));
         if cached {
             let account = account.context("the current login is not stashed; run `ccs add --current` (with --codex for Codex)")?;
-            let reading = ctx.usage.read(&account.slug)?;
-            let (usage, polled_at) = match reading {
-                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
-                None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
-            };
+            let (usage, polled_at) = standing(ctx.usage.read(&account.slug)?);
             readings.push(Cached {
                 entry: Entry {
                     provider,
@@ -938,7 +945,11 @@ pub fn switch(ctx: &Ctx, needle: &str, force: bool) -> Result<Switched> {
     // may have refreshed this very account, and the copy taken beforehand
     // carries the tokens that refresh superseded.
     let target = stash::resolve(&accounts, &slug)?.clone();
-    guard_exhausted(&entry_of(&target, &probe, false), force)?;
+    let entry = entry_of(&target, &probe, false);
+    if entry.signed_out() {
+        bail!("{} is {}", target.account.email, render::SIGNED_OUT);
+    }
+    guard_exhausted(&entry, force)?;
     let told = switch_to(ctx, &mut accounts, &target)?;
     Ok(Switched { target, told })
 }
@@ -1139,6 +1150,10 @@ impl Desk<'_> {
         Ok(live)
     }
 
+    fn signed_out(&self, slug: &str) -> bool {
+        self.ctx.usage.read(slug).ok().flatten().is_some_and(|reading| reading.signed_out)
+    }
+
     /// The account of `provider` a request goes out as: the one in use,
     /// unless it is among `avoid`, and then the first pooled account of that
     /// provider that is not.
@@ -1152,6 +1167,7 @@ impl Desk<'_> {
         let usable = |slug: &str| {
             accounts.iter().any(|a| a.slug == slug && a.account.provider == provider)
                 && !avoid.iter().any(|a| a == slug)
+                && !self.signed_out(slug)
         };
         if let Some(slug) = live.filter(|s| usable(s)) {
             return Ok(slug.to_string());
@@ -1161,7 +1177,8 @@ impl Desk<'_> {
         }
         match (live, avoid.is_empty()) {
             (None, true) => bail!("no {provider} account is in use; `ccs use` one"),
-            _ => bail!("every account is limited: {}", avoid.join(", ")),
+            (Some(slug), true) => bail!("{slug} is {}", render::SIGNED_OUT),
+            _ => bail!("every account is limited or signed out: {}", avoid.join(", ")),
         }
     }
 
@@ -1250,8 +1267,8 @@ impl serve::Accounts for Desk<'_> {
             let slug = rule
                 .accounts
                 .iter()
-                .find(|s| !avoid.contains(s))
-                .context("all accounts assigned to this model are limited")?;
+                .find(|s| !avoid.contains(s) && !self.signed_out(s))
+                .context("all accounts assigned to this model are limited or signed out")?;
             let live = self.live(&accounts)?;
             self.hand_out(slug, &mut accounts, &live)
         };
@@ -1626,7 +1643,9 @@ struct View<'a> {
     plan: &'a str,
     active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
+    error: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    signed_out: bool,
     /// When the limits were read, for a listing that did not read them now.
     #[serde(skip_serializing_if = "Option::is_none")]
     polled_at: Option<&'a str>,
@@ -1642,7 +1661,8 @@ fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
         email: &entry.email,
         plan: &entry.plan,
         active: entry.active,
-        error: entry.usage.as_ref().err().map(String::as_str),
+        error: entry.usage.as_ref().err().map(ToString::to_string),
+        signed_out: entry.signed_out(),
         polled_at,
         limits: entry.known(),
         model_usage: entry.models(),
@@ -2093,6 +2113,28 @@ mod tests {
         assert_eq!(reading.usage.model_usage.unwrap()["gpt-6-astra"].available, Some(false));
     }
 
+    #[test]
+    fn a_refused_refresh_is_a_signed_out_account_whatever_wraps_it() {
+        let error = anyhow::Error::new(SignedOut { relogin: "log in" }).context("probing");
+        assert_eq!(unread(&error), Unread::SignedOut);
+        assert!(matches!(unread(&anyhow::anyhow!("offline")), Unread::Failed(_)));
+    }
+
+    #[test]
+    fn a_signed_out_account_stays_signed_out_for_readers_that_cannot_poll() {
+        let fixture = Fixture::new("signed-out");
+        let entry = stashed("a", oauth("r-a", 0));
+        fixture.stash.save(&entry.slug, &entry.account).expect("stash");
+        fixture.usage.record("a", &vec![limit!("session", 42.0)].into()).expect("records");
+
+        let gone = Probe { slug: "a".into(), refreshed: None, usage: Err(Unread::SignedOut) };
+        remember(&fixture.ctx(), std::slice::from_ref(&gone)).expect("records");
+
+        let entries = readings(&fixture.ctx()).expect("lists");
+        assert!(entries[0].entry.signed_out());
+        assert!(entries[0].entry.known().is_empty());
+    }
+
     /// A reader that cannot afford a poll — a menu bar repainting every few
     /// seconds — takes what the last poll wrote down, and is told how old it
     /// is; an account nothing has polled yet is said to be unread, not broken.
@@ -2114,7 +2156,7 @@ mod tests {
         assert!(entries[0].polled_at.is_some());
         assert!(!entries[0].entry.active);
         assert!(entries[1].entry.active);
-        assert!(entries[1].entry.usage.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[1].entry.usage.as_ref().unwrap_err().to_string().contains("not polled"));
         assert!(entries[1].polled_at.is_none());
     }
 
@@ -2441,7 +2483,7 @@ mod tests {
         fixture.stash.save("g", &g.account).unwrap();
         fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
         let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
-        assert!(entries[0].entry.usage.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[0].entry.usage.as_ref().unwrap_err().to_string().contains("not polled"));
         assert!(entries[0].polled_at.is_none());
         assert_eq!(fixture.codex_live().as_deref(), Some("expired"));
     }
@@ -2618,6 +2660,40 @@ mod tests {
             desk.grant(Provider::Claude, None, &["b".into(), "c".into()]).expect("grants").slug,
             "a"
         );
+    }
+
+    #[test]
+    fn a_signed_out_account_is_passed_over_for_the_pool_and_for_routes() {
+        use crate::routing::{Routing, Rule};
+        let fixture = desk_fixture("desk-signed-out", Some("b"), &["a", "c"]);
+        fixture.usage.record_signed_out("b").expect("b signed out");
+        fixture.usage.record_signed_out("a").expect("a signed out");
+        Routing {
+            rules: vec![Rule {
+                provider: Provider::Claude,
+                model: "claude-opus-*".into(),
+                accounts: vec!["a".into(), "c".into()],
+            }],
+        }
+        .write(fixture.stash.root())
+        .unwrap();
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+
+        assert_eq!(desk.grant(Provider::Claude, None, &[]).expect("grants").slug, "c");
+        let routed = desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[]);
+        assert_eq!(routed.expect("grants").slug, "c");
+    }
+
+    #[test]
+    fn a_signed_out_account_in_use_with_nowhere_to_go_says_it_is_signed_out() {
+        let fixture = desk_fixture("desk-signed-out-alone", Some("b"), &[]);
+        fixture.usage.record_signed_out("b").expect("b signed out");
+        let ctx = fixture.ctx();
+        let why = Desk { ctx: &ctx, pool: &fixture.pool }
+            .grant(Provider::Claude, None, &[])
+            .expect_err("signed out");
+        assert!(why.contains("signed out"), "{why}");
     }
 
     #[test]

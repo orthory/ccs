@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::api::Refreshed;
 use crate::fsx::write_atomic;
 use crate::model::{
-    Limit, LimitModel, LimitScope, ModelAvailability, Oauth, UsageResponse, now_ms,
+    Limit, LimitModel, LimitScope, ModelAvailability, Oauth, SignedOut, UsageResponse, now_ms,
 };
 
 /// Codex CLI's own OAuth client, which its refresh tokens were minted for.
@@ -430,7 +430,7 @@ impl Client {
         let status = resp.status().as_u16();
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         if status == 400 || status == 401 {
-            bail!("these credentials no longer refresh; {RELOGIN}");
+            return Err(SignedOut { relogin: RELOGIN }.into());
         }
         if status != 200 {
             bail!("token refresh failed ({status}): {}", snippet(&text));

@@ -34,6 +34,8 @@ pub struct Reading {
     /// When this was fetched, RFC 3339. A reader deciding whether to trust a
     /// reading has to be told its age, because nothing in the limits says.
     pub polled_at: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signed_out: bool,
     #[serde(flatten)]
     pub usage: UsageResponse,
 }
@@ -57,7 +59,15 @@ impl Cache {
     /// polling at once record their own readings instead of landing on each
     /// other's.
     pub fn record(&self, slug: &str, usage: &UsageResponse) -> Result<()> {
-        let reading = Reading { polled_at: Timestamp::now().to_string(), usage: usage.clone() };
+        self.write(slug, false, usage.clone())
+    }
+
+    pub fn record_signed_out(&self, slug: &str) -> Result<()> {
+        self.write(slug, true, UsageResponse::default())
+    }
+
+    fn write(&self, slug: &str, signed_out: bool, usage: UsageResponse) -> Result<()> {
+        let reading = Reading { polled_at: Timestamp::now().to_string(), signed_out, usage };
         let body = serde_json::to_vec_pretty(&reading).context("serialising a usage reading")?;
         write_atomic(&self.at(slug), &body, FILE_MODE)
     }
@@ -128,6 +138,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn a_signed_out_account_is_recorded_as_such_until_a_reading_replaces_it() {
+        let fixture = Fixture::new("signed-out");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records");
+        fixture.cache.record_signed_out("a").expect("records signed out");
+
+        let back = fixture.cache.read("a").expect("reads").expect("a reading");
+        assert!(back.signed_out);
+        assert!(back.usage.limits.is_empty());
+
+        fixture.cache.record("a", &vec![limit!("session", 5.0)].into()).expect("records again");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.cache.at("a")).unwrap()).unwrap();
+        assert!(raw.get("signed_out").is_none());
+        assert!(!fixture.read("a").signed_out);
     }
 
     #[test]

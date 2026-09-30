@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::IsTerminal;
 
 use jiff::Timestamp;
@@ -42,10 +43,43 @@ pub struct Entry {
     pub active: bool,
     /// The account's limits, or why they could not be read. One field rather
     /// than two, so "has limits" and "failed" cannot both be true at once.
-    pub usage: Result<UsageResponse, String>,
+    pub usage: Result<UsageResponse, Unread>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Unread {
+    SignedOut,
+    Failed(String),
+}
+
+impl fmt::Display for Unread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignedOut => f.write_str(SIGNED_OUT),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<String> for Unread {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl From<&str> for Unread {
+    fn from(why: &str) -> Self {
+        Self::Failed(why.to_string())
+    }
+}
+
+pub const SIGNED_OUT: &str = "signed out; `ccs add` signs this account in again";
+
 impl Entry {
+    pub fn signed_out(&self) -> bool {
+        matches!(self.usage, Err(Unread::SignedOut))
+    }
+
     /// The limits that were readable; empty when the probe failed.
     pub fn known(&self) -> &[Limit] {
         self.usage.as_ref().map(|u| u.limits.as_slice()).unwrap_or(&[])
@@ -182,7 +216,8 @@ impl Table {
         let sections = Provider::ALL
             .into_iter()
             .filter_map(|provider| {
-                let accounts: Vec<_> = entries.iter().filter(|e| e.provider == provider).collect();
+                let accounts: Vec<_> =
+                    entries.iter().filter(|e| e.provider == provider && !e.signed_out()).collect();
                 if accounts.is_empty() {
                     return None;
                 }
@@ -257,8 +292,11 @@ impl Table {
             }
             lines.push(format!("  {}", self.style.bold(section.provider.label())));
             lines.push(format!("  {}", self.header(section)));
-            for (index, _) in
-                self.entries.iter().enumerate().filter(|(_, e)| e.provider == section.provider)
+            for (index, _) in self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.provider == section.provider && !e.signed_out())
             {
                 for (line, text) in self.row(index).lines().enumerate() {
                     let marker = if line == 0 && selected == Some(index) { "> " } else { "  " };
@@ -266,7 +304,37 @@ impl Table {
                 }
             }
         }
+        let signed_out: Vec<(usize, &Entry)> =
+            self.entries.iter().enumerate().filter(|(_, e)| e.signed_out()).collect();
+        if signed_out.is_empty() {
+            return lines;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!(
+            "  {}  {}",
+            self.style.bold("Signed out"),
+            self.style.dim("`ccs add` signs these in again")
+        ));
+        let email_width = signed_out.iter().map(|(_, e)| e.email.len()).max().unwrap_or(0);
+        let plan_width = signed_out.iter().map(|(_, e)| e.plan.len()).max().unwrap_or(0);
+        for (index, entry) in signed_out {
+            let text = format!(
+                "{:>2} {:<email_width$}  {:<plan_width$}  {}",
+                index + 1,
+                entry.email,
+                entry.plan,
+                entry.provider.label()
+            );
+            let suffix = if entry.active { self.style.bold("  <- active") } else { String::new() };
+            lines.push(format!("  {}{suffix}", self.style.dim(&text)));
+        }
         lines
+    }
+
+    pub fn selectable(&self) -> Vec<usize> {
+        (0..self.entries.len()).filter(|&index| !self.entries[index].signed_out()).collect()
     }
 
     fn header(&self, section: &Section) -> String {
@@ -320,7 +388,8 @@ impl Table {
         };
         let suffix = if entry.active { self.style.bold("  <- active") } else { String::new() };
         if let Err(error) = &entry.usage {
-            return format!("{head}  {}{suffix}", self.style.health(error, Health::Critical));
+            let error = error.to_string();
+            return format!("{head}  {}{suffix}", self.style.health(&error, Health::Critical));
         }
         let no_readings = section.columns.is_empty() && section.models.is_empty();
         if no_readings {
@@ -824,6 +893,46 @@ mod tests {
         assert!(screen.contains("CACHED WINDOW"));
         assert!(screen.contains("42%"));
         assert!(!screen.contains("WEEKLY"));
+    }
+
+    fn signed_out(email: &str, provider: Provider) -> Entry {
+        let mut entry = entry(email, vec![]);
+        entry.provider = provider;
+        entry.usage = Err(Unread::SignedOut);
+        entry
+    }
+
+    #[test]
+    fn signed_out_accounts_leave_their_provider_for_a_section_of_their_own() {
+        let entries = vec![
+            signed_out("gone@x.com", Provider::Claude),
+            entry("here@x.com", vec![limit!("session", 3.0)]),
+            signed_out("lapsed@x.com", Provider::Codex),
+        ];
+        let lines = Table::build(entries, plain()).lines(None);
+        let heading = lines.iter().position(|l| l.contains("Signed out")).expect("a heading");
+
+        assert!(lines[..heading].iter().any(|l| l.contains(" 2 here@x.com")));
+        assert!(lines[..heading].iter().all(|l| !l.contains("gone@x.com")));
+        assert!(lines.iter().all(|l| l.trim() != "Codex"), "no Codex account is signed in");
+        assert!(
+            lines[heading..]
+                .iter()
+                .any(|l| l.contains(" 1 gone@x.com") && l.contains("Claude Code"))
+        );
+        assert!(
+            lines[heading..].iter().any(|l| l.contains(" 3 lapsed@x.com") && l.contains("Codex"))
+        );
+        assert!(lines.iter().all(|l| !l.contains("no longer refresh")));
+    }
+
+    #[test]
+    fn a_signed_out_account_cannot_be_selected() {
+        let entries = vec![
+            signed_out("gone@x.com", Provider::Claude),
+            entry("here@x.com", vec![limit!("session", 3.0)]),
+        ];
+        assert_eq!(Table::build(entries, plain()).selectable(), [1]);
     }
 
     #[test]
