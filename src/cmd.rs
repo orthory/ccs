@@ -192,6 +192,7 @@ fn freshen(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Option<Oauth
 /// when that is this account. Pins contribute their provider's credentials.
 fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&Oauth>) -> Result<Vec<Oauth>> {
     let mut held = vec![entry.account.oauth.clone()];
+    held.extend(ctx.stash.load(&entry.slug)?.map(|account| account.oauth));
     held.extend(installed.cloned());
     match entry.account.provider {
         Provider::Claude => {
@@ -331,6 +332,34 @@ fn persist(ctx: &Ctx, accounts: &mut [Stashed], probes: &[Probe], live: &Live) -
         let Some(oauth) = &probe.refreshed else { continue };
         let Some(entry) = accounts.iter_mut().find(|a| a.slug == probe.slug) else { continue };
         propagate(ctx, entry, oauth, live)?;
+    }
+    Ok(())
+}
+
+fn retry_lost_refreshes(
+    ctx: &Ctx,
+    accounts: &mut [Stashed],
+    probes: &mut [Probe],
+    live: &Live,
+) -> Result<()> {
+    let unrefreshed = |accounts: &[Stashed], slug: &str| {
+        accounts.iter().any(|a| a.slug == slug && a.account.oauth.needs_refresh())
+    };
+    let lost: Vec<String> = probes
+        .iter()
+        .filter(|p| p.usage.is_err() && unrefreshed(accounts, &p.slug))
+        .map(|p| p.slug.clone())
+        .collect();
+    if lost.is_empty() {
+        return Ok(());
+    }
+    reconcile(ctx, accounts, live)?;
+    for slot in probes.iter_mut().filter(|p| lost.contains(&p.slug)) {
+        let Some(entry) = accounts.iter().find(|a| a.slug == slot.slug) else { continue };
+        if entry.account.oauth.needs_refresh() {
+            continue;
+        }
+        *slot = probe(ctx.apis(), entry);
     }
     Ok(())
 }
@@ -899,9 +928,11 @@ pub fn switch(ctx: &Ctx, needle: &str, force: bool) -> Result<Switched> {
 
     let live = identify_live(ctx, &accounts)?;
     reconcile(ctx, &mut accounts, &live)?;
-    let probe = probe(ctx.apis(), stash::resolve(&accounts, &slug)?);
-    persist(ctx, &mut accounts, std::slice::from_ref(&probe), &live)?;
-    remember(ctx, std::slice::from_ref(&probe))?;
+    let mut probes = [probe(ctx.apis(), stash::resolve(&accounts, &slug)?)];
+    persist(ctx, &mut accounts, &probes, &live)?;
+    retry_lost_refreshes(ctx, &mut accounts, &mut probes, &live)?;
+    remember(ctx, &probes)?;
+    let [probe] = probes;
 
     // Read after the probe has been folded back in, never before it: the probe
     // may have refreshed this very account, and the copy taken beforehand
@@ -1422,8 +1453,9 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Live)> {
     let live = identify_live(ctx, accounts)?;
     reconcile(ctx, accounts, &live)?;
-    let probes = probe_all(ctx.apis(), accounts);
+    let mut probes = probe_all(ctx.apis(), accounts);
     persist(ctx, accounts, &probes, &live)?;
+    retry_lost_refreshes(ctx, accounts, &mut probes, &live)?;
     remember(ctx, &probes)?;
 
     let entries = accounts
@@ -1931,6 +1963,18 @@ mod tests {
         assert_eq!(stashed, "rotated", "the stash");
         assert_eq!(live.as_deref(), Some("rotated"), "the live credentials");
         assert_eq!(pen.as_deref(), Some("rotated"), "the pen");
+    }
+
+    #[test]
+    fn a_list_held_in_memory_takes_up_a_refresh_another_process_stashed() {
+        let fixture = Fixture::new("stale-memory");
+        stash_all(&fixture, &[stashed("work", oauth("rotated", 2))]);
+
+        let mut accounts = vec![stashed("work", oauth("superseded", 1))];
+        reconcile(&fixture.ctx(), &mut accounts, &claude_live("other")).expect("reconcile");
+
+        assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
+        assert_eq!(fixture.tokens("work").0, "rotated", "the stash");
     }
 
     #[test]

@@ -87,6 +87,18 @@ impl Stash {
         Ok(out)
     }
 
+    pub fn load(&self, slug: &str) -> Result<Option<Account>> {
+        let path = self.accounts.join(format!("{slug}.json"));
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let account =
+            serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(account))
+    }
+
     pub fn save(&self, slug: &str, account: &Account) -> Result<()> {
         let body = serde_json::to_vec_pretty(account).context("serialising account")?;
         write_atomic(&self.accounts.join(format!("{slug}.json")), &body, FILE_MODE)
