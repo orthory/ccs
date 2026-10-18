@@ -331,7 +331,61 @@ pub trait Accounts {
     /// when one can be had; `None` when it was as fresh as they come.
     fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String>;
 
-    fn status(&self) -> Result<Vec<Standing>, String>;
+    fn survey(&self) -> Result<Survey, String>;
+}
+
+pub trait Reader: Send + Sync {
+    fn read(&self, grant: &Grant) -> Result<Reading>;
+}
+
+pub struct Survey {
+    pub due: Vec<Due>,
+    pub reader: Box<dyn Reader>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Due {
+    pub grant: Grant,
+    pub spent: bool,
+    pub last: Option<Reading>,
+}
+
+impl Survey {
+    pub fn standings(self, accounts: &dyn Accounts) -> Vec<Standing> {
+        let grants: Vec<Result<Grant, String>> =
+            self.due.iter().map(|due| due.renewed(accounts)).collect();
+        let reader = &*self.reader;
+        let reads: Vec<Option<Reading>> = thread::scope(|scope| {
+            let running: Vec<_> = grants
+                .into_iter()
+                .map(|grant| scope.spawn(move || reader.read(&grant.ok()?).ok()))
+                .collect();
+            running.into_iter().map(|read| read.join().ok().flatten()).collect()
+        });
+        self.due.iter().zip(reads).map(|(due, read)| due.standing(read)).collect()
+    }
+}
+
+impl Due {
+    fn renewed(&self, accounts: &dyn Accounts) -> Result<Grant, String> {
+        match self.spent {
+            false => Ok(self.grant.clone()),
+            true => accounts.grant(self.grant.provider, Some(&self.grant.slug), &[]),
+        }
+    }
+
+    fn standing(&self, read: Option<Reading>) -> Standing {
+        let (slug, provider) = (&self.grant.slug, self.grant.provider);
+        if let Some(reading) = read {
+            return Standing::of(slug, provider, Some(&reading), None);
+        }
+        let signed_out = self.last.as_ref().is_some_and(|last| last.signed_out);
+        let error = match signed_out {
+            true => Unreadable::SignedOut,
+            false => Unreadable::Unread,
+        };
+        Standing::of(slug, provider, self.last.as_ref(), Some(error))
+    }
 }
 
 pub fn label(slug: &str) -> &str {
@@ -629,11 +683,11 @@ fn report(
         write_error(out, 405, "invalid_request_error", "/ccs/status answers GET")?;
         return Ok(Outcome::refused(405));
     }
-    let Ok(standings) = accounts.status() else {
+    let Ok(survey) = accounts.survey() else {
         write_error(out, 503, "api_error", "the stash could not be read; `ccs ls` says why")?;
         return Ok(Outcome::refused(503));
     };
-    let body = json!({ "accounts": standings }).to_string();
+    let body = json!({ "accounts": survey.standings(accounts) }).to_string();
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
     write_response(out, 200, &headers, &mut body.as_bytes())?;
     Ok(Outcome::refused(200))
@@ -676,8 +730,8 @@ pub enum Ask {
         grant: Grant,
         reply: Sender<Result<Option<Grant>, String>>,
     },
-    Status {
-        reply: Sender<Result<Vec<Standing>, String>>,
+    Survey {
+        reply: Sender<Result<Survey, String>>,
     },
 }
 
@@ -694,7 +748,7 @@ impl Ask {
                 )))
             }
             Self::Stale { grant, reply } => drop(reply.send(accounts.stale(&grant))),
-            Self::Status { reply } => drop(reply.send(accounts.status())),
+            Self::Survey { reply } => drop(reply.send(accounts.survey())),
         }
     }
 }
@@ -741,9 +795,9 @@ impl Accounts for Line {
         answer.recv().map_err(|_| GONE.to_string())?
     }
 
-    fn status(&self) -> Result<Vec<Standing>, String> {
+    fn survey(&self) -> Result<Survey, String> {
         let (reply, answer) = mpsc::channel();
-        self.0.send(Ask::Status { reply }).map_err(|_| GONE.to_string())?;
+        self.0.send(Ask::Survey { reply }).map_err(|_| GONE.to_string())?;
         answer.recv().map_err(|_| GONE.to_string())?
     }
 }
@@ -1126,6 +1180,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    use crate::model::UsageResponse;
+
     const KEY: &str = "sk-ant-oat-ccs-0123";
     /// A Codex key as minted: a JWT naming account "ccs".
     const CODEX_KEY: &str = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiY2NzIn0sImNjcyI6IjAxMjMifQ.ccs";
@@ -1192,7 +1248,8 @@ mod tests {
         renewed: Vec<Grant>,
         /// Why falling over to the pool fails, when it does.
         broken: Option<String>,
-        standings: Vec<Standing>,
+        due: Vec<Due>,
+        reads: Vec<(String, UsageResponse)>,
         unsurveyed: Option<String>,
     }
 
@@ -1243,12 +1300,30 @@ mod tests {
             Ok(self.renewed.iter().find(|g| g.slug == grant.slug).cloned())
         }
 
-        fn status(&self) -> Result<Vec<Standing>, String> {
-            match &self.unsurveyed {
-                Some(why) => Err(why.clone()),
-                None => Ok(self.standings.clone()),
+        fn survey(&self) -> Result<Survey, String> {
+            if let Some(why) = &self.unsurveyed {
+                return Err(why.clone());
             }
+            Ok(Survey { due: self.due.clone(), reader: Box::new(Canned(self.reads.clone())) })
         }
+    }
+
+    struct Canned(Vec<(String, UsageResponse)>);
+
+    impl Reader for Canned {
+        fn read(&self, grant: &Grant) -> Result<Reading> {
+            let usage = self
+                .0
+                .iter()
+                .find(|(token, _)| *token == grant.token)
+                .map(|(_, usage)| usage.clone())
+                .context("no reading for that token")?;
+            Ok(Reading { polled_at: "2026-10-19T20:00:00Z".into(), signed_out: false, usage })
+        }
+    }
+
+    fn due(slug: &str) -> Due {
+        Due { grant: grant(slug), spent: false, last: None }
     }
 
     #[test]
@@ -1278,7 +1353,7 @@ mod tests {
             fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
                 Ok(None)
             }
-            fn status(&self) -> Result<Vec<Standing>, String> {
+            fn survey(&self) -> Result<Survey, String> {
                 unreachable!()
             }
         }
@@ -1334,7 +1409,7 @@ mod tests {
             fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
                 Ok(None)
             }
-            fn status(&self) -> Result<Vec<Standing>, String> {
+            fn survey(&self) -> Result<Survey, String> {
                 unreachable!()
             }
         }
@@ -1686,14 +1761,16 @@ mod tests {
         assert!(!wire.to_string().contains("x.com"), "{wire}");
     }
 
+    fn usage_at(session: f64) -> UsageResponse {
+        vec![crate::limit!("session", session), crate::limit!("weekly_all", 40.0)].into()
+    }
+
     #[test]
     fn status_answers_every_served_account_without_going_upstream() {
         let (up, seen) = upstream(vec![]);
         let pool = Pool {
-            standings: vec![
-                Standing::of("a_at_x.com", Provider::Claude, None, None),
-                Standing::of("b_at_y.com", Provider::Claude, None, Some(Unreadable::Unread)),
-            ],
+            due: vec![due("a_at_x.com"), due("b_at_y.com")],
+            reads: vec![("tok-a_at_x.com".into(), usage_at(4.0))],
             ..Default::default()
         };
 
@@ -1708,6 +1785,9 @@ mod tests {
             .map(|a| a["label"].as_str().expect("label"))
             .collect();
         assert_eq!(labels, ["a", "b"]);
+        assert_eq!(parsed["accounts"][0]["five_hour"]["percent"], 4.0);
+        assert_eq!(parsed["accounts"][0]["read_at"], "2026-10-19T20:00:00Z");
+        assert_eq!(parsed["accounts"][0]["error"], serde_json::Value::Null);
         assert_eq!(parsed["accounts"][1]["error"], "unread");
         assert!(seen.lock().expect("lock").is_empty());
         assert_eq!(outcome.slug, None);
@@ -1751,11 +1831,73 @@ mod tests {
     }
 
     #[test]
-    fn status_asked_over_the_line_is_answered_by_the_desk() {
+    fn a_spent_account_is_renewed_by_an_ordinary_hand_out_before_it_is_read() {
+        let pool = Pool {
+            grants: vec![grant("a_at_x.com")],
+            reads: vec![("tok-a_at_x.com".into(), usage_at(7.0))],
+            ..Default::default()
+        };
+        let spent = Due {
+            grant: Grant { token: "spent".into(), ..grant("a_at_x.com") },
+            spent: true,
+            last: None,
+        };
+        let survey = Survey { due: vec![spent], reader: Box::new(Canned(pool.reads.clone())) };
+
+        let standings = survey.standings(&pool);
+
+        assert_eq!(standings[0].five_hour.as_ref().map(|w| w.percent), Some(7.0));
+        assert_eq!(standings[0].error, None);
+        assert_eq!(*pool.asked_to_pin.borrow(), vec![Some("a_at_x.com".to_string())]);
+    }
+
+    #[test]
+    fn an_account_that_cannot_be_read_keeps_its_last_reading_and_says_unread() {
+        let pool = Pool::default();
+        let last = Reading {
+            polled_at: "2026-10-19T18:00:00Z".into(),
+            signed_out: false,
+            usage: usage_at(12.0),
+        };
+        let unread = Due { last: Some(last), ..due("a_at_x.com") };
+        let unrenewed = Due { spent: true, ..due("b_at_x.com") };
+        let survey = Survey { due: vec![unread, unrenewed], reader: Box::new(Canned(Vec::new())) };
+
+        let standings = survey.standings(&pool);
+
+        assert_eq!(standings[0].five_hour.as_ref().map(|w| w.percent), Some(12.0));
+        assert_eq!(standings[0].read_at.as_deref(), Some("2026-10-19T18:00:00Z"));
+        assert_eq!(standings[0].error, Some(Unreadable::Unread));
+        assert_eq!(standings[1].read_at, None);
+        assert_eq!(standings[1].error, Some(Unreadable::Unread));
+    }
+
+    #[test]
+    fn an_account_last_found_signed_out_that_still_cannot_be_read_stands_signed_out() {
+        let pool = Pool::default();
+        let last = Reading {
+            polled_at: "2026-10-19T18:00:00Z".into(),
+            signed_out: true,
+            usage: UsageResponse::default(),
+        };
+        let survey = Survey {
+            due: vec![Due { last: Some(last), ..due("a_at_x.com") }],
+            reader: Box::new(Canned(Vec::new())),
+        };
+
+        let standings = survey.standings(&pool);
+
+        assert_eq!(standings[0].five_hour, None);
+        assert_eq!(standings[0].error, Some(Unreadable::SignedOut));
+    }
+
+    #[test]
+    fn a_survey_asked_over_the_line_is_read_on_the_asking_thread() {
         let (asks, inbox) = mpsc::channel::<Ask>();
         let desk = std::thread::spawn(move || {
             let pool = Pool {
-                standings: vec![Standing::of("a_at_x.com", Provider::Claude, None, None)],
+                due: vec![due("a_at_x.com")],
+                reads: vec![("tok-a_at_x.com".into(), usage_at(4.0))],
                 ..Default::default()
             };
             for ask in inbox {
@@ -1763,10 +1905,84 @@ mod tests {
             }
         });
 
-        let standings = Line(asks).status().expect("answers");
+        let line = Line(asks);
+        let standings = line.survey().expect("answers").standings(&line);
+        drop(line);
 
         assert_eq!(standings.len(), 1);
         assert_eq!(standings[0].label, "a");
+        assert_eq!(standings[0].five_hour.as_ref().map(|w| w.percent), Some(4.0));
+        desk.join().expect("the desk ends with its last asker");
+    }
+
+    struct Held {
+        entered: Mutex<Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Reader for Held {
+        fn read(&self, _: &Grant) -> Result<Reading> {
+            self.entered.lock().expect("lock").send(()).expect("the test is waiting");
+            self.release.lock().expect("lock").recv().expect("the test releases the read");
+            Ok(Reading {
+                polled_at: "2026-10-19T20:00:00Z".into(),
+                signed_out: false,
+                usage: usage_at(1.0),
+            })
+        }
+    }
+
+    struct HeldDesk {
+        reader: Mutex<Option<Box<dyn Reader>>>,
+    }
+
+    impl Accounts for HeldDesk {
+        fn grant(&self, _: Provider, _: Option<&str>, _: &[String]) -> Result<Grant, String> {
+            Ok(grant("work_at_example.com"))
+        }
+
+        fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
+            Ok(None)
+        }
+
+        fn survey(&self) -> Result<Survey, String> {
+            let reader = self.reader.lock().expect("lock").take().expect("one survey");
+            Ok(Survey { due: vec![due("work_at_example.com")], reader })
+        }
+    }
+
+    #[test]
+    fn a_hand_out_answers_at_once_while_a_status_read_is_held_open() {
+        let (asks, inbox) = mpsc::channel::<Ask>();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let reader: Box<dyn Reader> =
+            Box::new(Held { entered: Mutex::new(entered_tx), release: Mutex::new(release_rx) });
+        let desk = std::thread::spawn(move || {
+            let desk = HeldDesk { reader: Mutex::new(Some(reader)) };
+            for ask in inbox {
+                ask.answer(&desk);
+            }
+        });
+        let status_line = Line(asks.clone());
+        let status = std::thread::spawn(move || {
+            let (up, _) = upstream(vec![]);
+            let mut out = Vec::new();
+            let upstreams = Upstreams { claude: &up, codex: &up };
+            answer(&get("/ccs/status", KEY), &keys(), &upstreams, &status_line, &mut out)
+                .expect("answers");
+            parse_response(&out)
+        });
+
+        entered.recv().expect("the status read is under way");
+        let granted = Line(asks.clone()).grant(Provider::Claude, None, &[]);
+        assert_eq!(granted.map(|g| g.slug), Ok("work_at_example.com".to_string()));
+
+        release.send(()).expect("releases the read");
+        let (code, body) = status.join().expect("the status thread");
+        assert_eq!(code, 200);
+        assert!(body.contains("\"label\":\"work\""), "{body}");
+        drop(asks);
         desk.join().expect("the desk ends with its last asker");
     }
 

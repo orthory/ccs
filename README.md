@@ -455,10 +455,13 @@ names) the way `ccs status` does, and answers JSON:
   "error": null}]}
 ```
 
+The reads run on the request's own connection, so requests waiting for an
+account are never held up behind them. An account whose token is spent is
+renewed first, the same way a request sent as that account would renew it.
 An account that cannot be read keeps its last reading, with the time it was
-taken in `read_at`, and `error` says `unread`, or `signed_out` for an account
-whose credentials no longer refresh; `ccs ls` says why. The answer names no
-email address, token or organization.
+taken in `read_at`, and `error` says `unread`, or `signed_out` when the last
+poll found its credentials no longer refresh; `ccs ls` says why. The answer
+names no email address, token or organization.
 
 Only `127.0.0.1` is listened on. Only paths under `/v1/` (Anthropic) and
 `/backend-api/` (Codex) are relayed, and `/ccs/status` is answered by the
