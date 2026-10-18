@@ -436,8 +436,33 @@ token this tool thought was fresh is taken for a session having refreshed the
 live credentials underneath it; the copies are brought level and the request
 sent once more.
 
-Only `127.0.0.1` is listened on, and only paths under `/v1/` (Anthropic) and
-`/backend-api/` (Codex) are relayed.
+Every relayed answer carries `x-ccs-account`, naming the account that answered
+it by its slug up to `_at_`: `you` for `you_at_example.com`. It names the
+account that finally answered, so after a fall-over it is the pooled account,
+not the one in use. It is the same header a request pins with.
+
+`GET /ccs/status`, sent with either gateway key, reads every account the gateway
+serves (the account in use, the `--rotate` pool, and any account a model route
+names) the way `ccs status` does, and answers JSON:
+
+```json
+{"accounts": [{"label": "you", "provider": "claude",
+  "read_at": "2026-10-19T19:40:02Z",
+  "five_hour": {"percent": 4.0, "resets_at": "2026-10-19T22:00:00Z"},
+  "weekly": {"percent": 53.0, "resets_at": "2026-10-22T16:00:00Z"},
+  "models": [{"model": "Fable", "kind": "weekly_scoped", "percent": 0.0,
+    "resets_at": "2026-10-22T16:00:00Z"}],
+  "error": null}]}
+```
+
+An account that cannot be read keeps its last reading, with the time it was
+taken in `read_at`, and `error` says `unread`, or `signed_out` for an account
+whose credentials no longer refresh; `ccs ls` says why. The answer names no
+email address, token or organization.
+
+Only `127.0.0.1` is listened on. Only paths under `/v1/` (Anthropic) and
+`/backend-api/` (Codex) are relayed, and `/ccs/status` is answered by the
+gateway itself.
 
 The Codex side works the same way with a second key. pi's built-in
 `openai-codex` provider is told `"baseUrl": "http://127.0.0.1:4141/backend-api"`

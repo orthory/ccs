@@ -25,10 +25,12 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::fsx::write_atomic;
-use crate::model::Provider;
+use crate::model::{Limit, Provider};
+use crate::usage::Reading;
 
 /// The key file is a credential in its own right: owner-only.
 const KEY_MODE: u32 = 0o600;
@@ -49,6 +51,8 @@ const KEY_PREFIX: &str = "sk-ant-oat-ccs-";
 /// email, or an unambiguous prefix of either, read the way `ccs use` reads
 /// one. A pinned request ignores the account in use and the pool both.
 pub const PIN_HEADER: &str = "x-ccs-account";
+
+pub const STATUS_PATH: &str = "/ccs/status";
 
 /// Bodies are held whole so a limited request can be tried again on another
 /// account. Anything past this is not a conversation.
@@ -270,6 +274,7 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
@@ -325,6 +330,84 @@ pub trait Accounts {
     /// The server refused `grant`'s token. A newer one for the same account,
     /// when one can be had; `None` when it was as fresh as they come.
     fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String>;
+
+    fn status(&self) -> Result<Vec<Standing>, String>;
+}
+
+pub fn label(slug: &str) -> &str {
+    slug.split_once("_at_").map_or(slug, |(local, _)| local)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Standing {
+    pub label: String,
+    pub provider: Provider,
+    pub read_at: Option<String>,
+    pub five_hour: Option<Window>,
+    pub weekly: Option<Window>,
+    pub models: Vec<ModelWindow>,
+    pub error: Option<Unreadable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Window {
+    pub percent: f64,
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelWindow {
+    pub model: String,
+    pub kind: String,
+    pub percent: f64,
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unreadable {
+    SignedOut,
+    Unread,
+}
+
+impl Standing {
+    pub fn of(
+        slug: &str,
+        provider: Provider,
+        reading: Option<&Reading>,
+        error: Option<Unreadable>,
+    ) -> Self {
+        let limits = reading.map_or(&[][..], |r| r.usage.limits.as_slice());
+        let unscoped = |kind: &str| {
+            limits.iter().find(|l| l.kind == kind && l.model_name().is_none()).map(Window::of)
+        };
+        Self {
+            label: label(slug).to_string(),
+            provider,
+            read_at: reading.map(|r| r.polled_at.clone()),
+            five_hour: unscoped("session"),
+            weekly: unscoped("weekly_all"),
+            models: limits.iter().filter_map(ModelWindow::of).collect(),
+            error,
+        }
+    }
+}
+
+impl Window {
+    fn of(limit: &Limit) -> Self {
+        Self { percent: limit.percent, resets_at: limit.resets_at.clone() }
+    }
+}
+
+impl ModelWindow {
+    fn of(limit: &Limit) -> Option<Self> {
+        Some(Self {
+            model: limit.model_name()?.to_string(),
+            kind: limit.kind.clone(),
+            percent: limit.percent,
+            resets_at: limit.resets_at.clone(),
+        })
+    }
 }
 
 /// Response headers that describe the hop upstream rather than the answer.
@@ -443,6 +526,9 @@ pub fn answer(
         write_error(out, 426, "invalid_request_error", "sockets are not relayed; send requests")?;
         return Ok(Outcome::refused(426));
     }
+    if request.target.split('?').next() == Some(STATUS_PATH) {
+        return report(request, keys, accounts, out);
+    }
     let Some((provider, target)) = route(&request.target) else {
         write_error(out, 404, "not_found_error", "only /v1/ and /backend-api/ are relayed")?;
         return Ok(Outcome::refused(404));
@@ -513,12 +599,44 @@ pub fn answer(
             _ => {}
         }
         outcome.status = reply.status;
+        let headers = labelled(reply.headers, &grant.slug);
         match bodiless(&request.method, reply.status) {
-            true => write_head(out, reply.status, &reply.headers)?,
-            false => write_response(out, reply.status, &reply.headers, &mut reply.body)?,
+            true => write_head(out, reply.status, &headers)?,
+            false => write_response(out, reply.status, &headers, &mut reply.body)?,
         }
         return Ok(outcome);
     }
+}
+
+fn labelled(mut headers: Vec<(String, String)>, slug: &str) -> Vec<(String, String)> {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(PIN_HEADER));
+    headers.push((PIN_HEADER.to_string(), label(slug).to_string()));
+    headers
+}
+
+fn report(
+    request: &Request,
+    keys: &Keys,
+    accounts: &dyn Accounts,
+    out: &mut impl Write,
+) -> io::Result<Outcome> {
+    let known = request.presents(&keys.claude) || request.presents(&keys.codex);
+    if !known {
+        write_error(out, 401, "authentication_error", "no such gateway key")?;
+        return Ok(Outcome::refused(401));
+    }
+    if !request.method.eq_ignore_ascii_case("GET") {
+        write_error(out, 405, "invalid_request_error", "/ccs/status answers GET")?;
+        return Ok(Outcome::refused(405));
+    }
+    let Ok(standings) = accounts.status() else {
+        write_error(out, 503, "api_error", "the stash could not be read; `ccs ls` says why")?;
+        return Ok(Outcome::refused(503));
+    };
+    let body = json!({ "accounts": standings }).to_string();
+    let headers = vec![("content-type".to_string(), "application/json".to_string())];
+    write_response(out, 200, &headers, &mut body.as_bytes())?;
+    Ok(Outcome::refused(200))
 }
 
 /// How a request was answered, for the log line.
@@ -558,6 +676,9 @@ pub enum Ask {
         grant: Grant,
         reply: Sender<Result<Option<Grant>, String>>,
     },
+    Status {
+        reply: Sender<Result<Vec<Standing>, String>>,
+    },
 }
 
 impl Ask {
@@ -573,6 +694,7 @@ impl Ask {
                 )))
             }
             Self::Stale { grant, reply } => drop(reply.send(accounts.stale(&grant))),
+            Self::Status { reply } => drop(reply.send(accounts.status())),
         }
     }
 }
@@ -616,6 +738,12 @@ impl Accounts for Line {
     fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String> {
         let (reply, answer) = mpsc::channel();
         self.0.send(Ask::Stale { grant: grant.clone(), reply }).map_err(|_| GONE.to_string())?;
+        answer.recv().map_err(|_| GONE.to_string())?
+    }
+
+    fn status(&self) -> Result<Vec<Standing>, String> {
+        let (reply, answer) = mpsc::channel();
+        self.0.send(Ask::Status { reply }).map_err(|_| GONE.to_string())?;
         answer.recv().map_err(|_| GONE.to_string())?
     }
 }
@@ -1064,6 +1192,8 @@ mod tests {
         renewed: Vec<Grant>,
         /// Why falling over to the pool fails, when it does.
         broken: Option<String>,
+        standings: Vec<Standing>,
+        unsurveyed: Option<String>,
     }
 
     fn grant(slug: &str) -> Grant {
@@ -1112,6 +1242,13 @@ mod tests {
             self.marked_stale.borrow_mut().push(grant.slug.clone());
             Ok(self.renewed.iter().find(|g| g.slug == grant.slug).cloned())
         }
+
+        fn status(&self) -> Result<Vec<Standing>, String> {
+            match &self.unsurveyed {
+                Some(why) => Err(why.clone()),
+                None => Ok(self.standings.clone()),
+            }
+        }
     }
 
     #[test]
@@ -1140,6 +1277,9 @@ mod tests {
             }
             fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
                 Ok(None)
+            }
+            fn status(&self) -> Result<Vec<Standing>, String> {
+                unreachable!()
             }
         }
         let handles: Vec<_> = ["claude-opus-test", "claude-fable-test"]
@@ -1193,6 +1333,9 @@ mod tests {
             }
             fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
                 Ok(None)
+            }
+            fn status(&self) -> Result<Vec<Standing>, String> {
+                unreachable!()
             }
         }
         let (up, _) = upstream(vec![(429, "limited"), (200, "ok")]);
@@ -1392,6 +1535,239 @@ mod tests {
         let pool = Pool { grants: vec![grant("work")], ..Default::default() };
         let (status, _) = answered(&post("/admin", KEY), &up, &pool);
         assert_eq!(status, 404);
+    }
+
+    fn answered_raw(request: &Request, upstream: &Upstream, pool: &dyn Accounts) -> String {
+        let upstreams = Upstreams { claude: upstream, codex: upstream };
+        let mut out = Vec::new();
+        answer(request, &keys(), &upstreams, pool, &mut out).expect("answers");
+        String::from_utf8(out).expect("ascii")
+    }
+
+    fn header_in(raw: &str, name: &str) -> Vec<String> {
+        let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
+        head.lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(": "))
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_string())
+            .collect()
+    }
+
+    fn get(path: &str, key: &str) -> Request {
+        request(&format!("GET {path} HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\r\n"))
+    }
+
+    #[test]
+    fn the_label_is_the_slug_up_to_its_at() {
+        assert_eq!(label("anthropic3-eph_at_ducktape.industries"), "anthropic3-eph");
+        assert_eq!(label("jesse.claude.ext.5_at_proton.me"), "jesse.claude.ext.5");
+        assert_eq!(label("codex-you_at_x.com"), "codex-you");
+        assert_eq!(label("plain"), "plain");
+    }
+
+    #[test]
+    fn a_relayed_answer_names_the_account_that_gave_it() {
+        let (up, _) = upstream(vec![(200, r#"{"id":"msg"}"#)]);
+        let pool = Pool { grants: vec![grant("work_at_example.com")], ..Default::default() };
+
+        let raw = answered_raw(&post("/v1/messages", KEY), &up, &pool);
+
+        assert_eq!(header_in(&raw, PIN_HEADER), ["work"], "{raw}");
+    }
+
+    #[test]
+    fn an_answer_after_falling_over_names_the_account_that_answered() {
+        let (up, _) = upstream(vec![(429, r#"{"rate":"limited"}"#), (200, r#"{"id":"ok"}"#)]);
+        let pool = Pool {
+            grants: vec![grant("work_at_example.com"), grant("alt_at_example.org")],
+            ..Default::default()
+        };
+
+        let raw = answered_raw(&post("/v1/messages", KEY), &up, &pool);
+
+        assert_eq!(header_in(&raw, PIN_HEADER), ["alt"], "{raw}");
+    }
+
+    #[test]
+    fn an_upstream_header_of_the_same_name_is_replaced_not_repeated() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("X-CCS-Account".to_string(), "upstream".to_string()),
+        ];
+        let labelled = labelled(headers, "work_at_example.com");
+        let named: Vec<_> =
+            labelled.iter().filter(|(n, _)| n.eq_ignore_ascii_case(PIN_HEADER)).collect();
+        assert_eq!(named, [&(PIN_HEADER.to_string(), "work".to_string())]);
+    }
+
+    fn reading(limits: Vec<Limit>) -> Reading {
+        Reading {
+            polled_at: "2026-10-19T19:00:00Z".into(),
+            signed_out: false,
+            usage: limits.into(),
+        }
+    }
+
+    #[test]
+    fn a_standing_takes_the_five_hour_and_weekly_windows_and_keeps_model_limits_apart() {
+        let reading = reading(vec![
+            crate::limit!("session", 4.0, resets = "2026-10-19T22:00:00Z"),
+            crate::limit!("weekly_all", 53.0, resets = "2026-10-22T16:00:00Z"),
+            crate::limit!("weekly_scoped", 7.0, model = "Fable", resets = "2026-10-22T16:00:00Z"),
+        ]);
+
+        let standing = Standing::of(
+            "anthropic3-eph_at_ducktape.industries",
+            Provider::Claude,
+            Some(&reading),
+            None,
+        );
+
+        assert_eq!(
+            standing,
+            Standing {
+                label: "anthropic3-eph".into(),
+                provider: Provider::Claude,
+                read_at: Some("2026-10-19T19:00:00Z".into()),
+                five_hour: Some(Window {
+                    percent: 4.0,
+                    resets_at: Some("2026-10-19T22:00:00Z".into())
+                }),
+                weekly: Some(Window {
+                    percent: 53.0,
+                    resets_at: Some("2026-10-22T16:00:00Z".into())
+                }),
+                models: vec![ModelWindow {
+                    model: "Fable".into(),
+                    kind: "weekly_scoped".into(),
+                    percent: 7.0,
+                    resets_at: Some("2026-10-22T16:00:00Z".into()),
+                }],
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_standing_never_read_has_no_windows_and_says_why() {
+        let standing = Standing::of("a_at_x.com", Provider::Claude, None, Some(Unreadable::Unread));
+        assert_eq!(standing.read_at, None);
+        assert_eq!(standing.five_hour, None);
+        assert_eq!(standing.weekly, None);
+        assert!(standing.models.is_empty());
+        assert_eq!(standing.error, Some(Unreadable::Unread));
+    }
+
+    #[test]
+    fn a_standing_on_the_wire_names_no_address_and_carries_every_field() {
+        let reading = reading(vec![crate::limit!("session", 4.0)]);
+        let standing = Standing::of(
+            "a_at_x.com",
+            Provider::Claude,
+            Some(&reading),
+            Some(Unreadable::SignedOut),
+        );
+
+        let wire = serde_json::to_value(&standing).expect("serialises");
+
+        let mut fields: Vec<&str> =
+            wire.as_object().expect("an object").keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["error", "five_hour", "label", "models", "provider", "read_at", "weekly"]
+        );
+        assert_eq!(wire["label"], "a");
+        assert_eq!(wire["provider"], "claude");
+        assert_eq!(wire["error"], "signed_out");
+        assert_eq!(wire["five_hour"], json!({ "percent": 4.0, "resets_at": null }));
+        assert_eq!(wire["weekly"], serde_json::Value::Null);
+        assert!(!wire.to_string().contains("x.com"), "{wire}");
+    }
+
+    #[test]
+    fn status_answers_every_served_account_without_going_upstream() {
+        let (up, seen) = upstream(vec![]);
+        let pool = Pool {
+            standings: vec![
+                Standing::of("a_at_x.com", Provider::Claude, None, None),
+                Standing::of("b_at_y.com", Provider::Claude, None, Some(Unreadable::Unread)),
+            ],
+            ..Default::default()
+        };
+
+        let (status, body, outcome) = answered_fully(&get("/ccs/status", KEY), &up, &pool);
+
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let labels: Vec<_> = parsed["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .map(|a| a["label"].as_str().expect("label"))
+            .collect();
+        assert_eq!(labels, ["a", "b"]);
+        assert_eq!(parsed["accounts"][1]["error"], "unread");
+        assert!(seen.lock().expect("lock").is_empty());
+        assert_eq!(outcome.slug, None);
+    }
+
+    #[test]
+    fn status_takes_either_gateway_key_and_nothing_else() {
+        let (up, _) = upstream(vec![]);
+        let pool = Pool::default();
+
+        assert_eq!(answered(&get("/ccs/status", KEY), &up, &pool).0, 200);
+        assert_eq!(answered(&get("/ccs/status?x=1", CODEX_KEY), &up, &pool).0, 200);
+        let (status, body) = answered(&get("/ccs/status", "sk-ant-oat-ccs-nope"), &up, &pool);
+        assert_eq!(status, 401);
+        assert!(body.contains("authentication_error"), "{body}");
+    }
+
+    #[test]
+    fn a_status_the_stash_cannot_give_is_refused_without_its_paths() {
+        let (up, _) = upstream(vec![]);
+        let pool = Pool {
+            unsurveyed: Some("reading /home/ccs/.claude/ccs/usage/a_at_x.com.json".into()),
+            ..Default::default()
+        };
+
+        let (status, body) = answered(&get("/ccs/status", KEY), &up, &pool);
+
+        assert_eq!(status, 503);
+        assert!(body.contains("api_error"), "{body}");
+        assert!(!body.contains("x.com"), "{body}");
+    }
+
+    #[test]
+    fn status_answers_only_a_get() {
+        let (up, _) = upstream(vec![]);
+        let pool = Pool::default();
+
+        let (status, _) = answered(&post("/ccs/status", KEY), &up, &pool);
+
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn status_asked_over_the_line_is_answered_by_the_desk() {
+        let (asks, inbox) = mpsc::channel::<Ask>();
+        let desk = std::thread::spawn(move || {
+            let pool = Pool {
+                standings: vec![Standing::of("a_at_x.com", Provider::Claude, None, None)],
+                ..Default::default()
+            };
+            for ask in inbox {
+                ask.answer(&pool);
+            }
+        });
+
+        let standings = Line(asks).status().expect("answers");
+
+        assert_eq!(standings.len(), 1);
+        assert_eq!(standings[0].label, "a");
+        desk.join().expect("the desk ends with its last asker");
     }
 
     #[test]
