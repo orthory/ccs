@@ -40,6 +40,7 @@ pub struct Reading {
     pub usage: UsageResponse,
 }
 
+#[derive(Clone)]
 pub struct Cache {
     dir: PathBuf,
 }
@@ -58,18 +59,19 @@ impl Cache {
     /// One file per account rather than one file of accounts, so two runs
     /// polling at once record their own readings instead of landing on each
     /// other's.
-    pub fn record(&self, slug: &str, usage: &UsageResponse) -> Result<()> {
+    pub fn record(&self, slug: &str, usage: &UsageResponse) -> Result<Reading> {
         self.write(slug, false, usage.clone())
     }
 
     pub fn record_signed_out(&self, slug: &str) -> Result<()> {
-        self.write(slug, true, UsageResponse::default())
+        self.write(slug, true, UsageResponse::default()).map(drop)
     }
 
-    fn write(&self, slug: &str, signed_out: bool, usage: UsageResponse) -> Result<()> {
+    fn write(&self, slug: &str, signed_out: bool, usage: UsageResponse) -> Result<Reading> {
         let reading = Reading { polled_at: Timestamp::now().to_string(), signed_out, usage };
         let body = serde_json::to_vec_pretty(&reading).context("serialising a usage reading")?;
-        write_atomic(&self.at(slug), &body, FILE_MODE)
+        write_atomic(&self.at(slug), &body, FILE_MODE)?;
+        Ok(reading)
     }
 
     /// What an account was last seen to have left, for a reader that cannot
@@ -212,6 +214,17 @@ mod tests {
         let stamped = fixture.read("a").polled_at;
         let parsed: Timestamp = stamped.parse().unwrap_or_else(|e| panic!("{stamped}: {e}"));
         assert!((Timestamp::now().as_second() - parsed.as_second()).abs() < 60);
+    }
+
+    #[test]
+    fn a_recorded_reading_is_handed_back_as_written() {
+        let fixture = Fixture::new("handed-back");
+        let reading =
+            fixture.cache.record("a", &vec![limit!("session", 9.0)].into()).expect("records");
+
+        let back = fixture.read("a");
+        assert_eq!(reading.polled_at, back.polled_at);
+        assert_eq!(reading.usage.limits[0].percent, 9.0);
     }
 
     #[test]
