@@ -27,7 +27,7 @@ use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
 use crate::render::{self, Entry, Style, Table, Unread, Verb};
-use crate::serve::{self, Grant};
+use crate::serve::{self, Grant, Standing, Unreadable};
 use crate::stash::{self, Stash};
 use crate::usage;
 use crate::watch;
@@ -1154,6 +1154,24 @@ impl Desk<'_> {
         self.ctx.usage.read(slug).ok().flatten().is_some_and(|reading| reading.signed_out)
     }
 
+    fn served(&self, accounts: &[Stashed], live: &Live) -> Result<Vec<Stashed>> {
+        let routing = crate::routing::Routing::read(self.ctx.stash.root())?;
+        let in_use = Provider::ALL.into_iter().filter_map(|provider| live.of(provider));
+        let pooled = self.pool.iter().map(String::as_str);
+        let routed = routing.rules.iter().flat_map(|rule| rule.accounts.iter().map(String::as_str));
+        let mut slugs: Vec<&str> = Vec::new();
+        for slug in in_use.chain(pooled).chain(routed) {
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
+        }
+        Ok(slugs
+            .into_iter()
+            .filter_map(|slug| accounts.iter().find(|a| a.slug == slug))
+            .cloned()
+            .collect())
+    }
+
     /// The account of `provider` a request goes out as: the one in use,
     /// unless it is among `avoid`, and then the first pooled account of that
     /// provider that is not.
@@ -1304,6 +1322,31 @@ impl serve::Accounts for Desk<'_> {
         };
         renewed().map_err(|e| describe(&e))
     }
+
+    fn status(&self) -> Result<Vec<Standing>, String> {
+        let surveyed = || -> Result<Vec<Standing>> {
+            let accounts = self.ctx.stash.list()?;
+            let live = self.live(&accounts)?;
+            let mut served = self.served(&accounts, &live)?;
+            let probes = probed(self.ctx, &mut served, &live)?;
+            served
+                .iter()
+                .zip(&probes)
+                .map(|(account, probe)| reported(self.ctx, account, probe))
+                .collect()
+        };
+        surveyed().map_err(|e| describe(&e))
+    }
+}
+
+fn reported(ctx: &Ctx, account: &Stashed, probe: &Probe) -> Result<Standing> {
+    let reading = ctx.usage.read(&account.slug)?;
+    let error = match &probe.usage {
+        Ok(_) => None,
+        Err(Unread::SignedOut) => Some(Unreadable::SignedOut),
+        Err(Unread::Failed(_)) => Some(Unreadable::Unread),
+    };
+    Ok(Standing::of(&account.slug, account.account.provider, reading.as_ref(), error))
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
@@ -1469,11 +1512,7 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 /// results out as a table.
 fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Live)> {
     let live = identify_live(ctx, accounts)?;
-    reconcile(ctx, accounts, &live)?;
-    let mut probes = probe_all(ctx.apis(), accounts);
-    persist(ctx, accounts, &probes, &live)?;
-    retry_lost_refreshes(ctx, accounts, &mut probes, &live)?;
-    remember(ctx, &probes)?;
+    let probes = probed(ctx, accounts, &live)?;
 
     let entries = accounts
         .iter()
@@ -1481,6 +1520,15 @@ fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, L
         .map(|(account, probe)| entry_of(account, probe, live.holds(account)))
         .collect();
     Ok((Table::build(entries, style), live))
+}
+
+fn probed(ctx: &Ctx, accounts: &mut [Stashed], live: &Live) -> Result<Vec<Probe>> {
+    reconcile(ctx, accounts, live)?;
+    let mut probes = probe_all(ctx.apis(), accounts);
+    persist(ctx, accounts, &probes, live)?;
+    retry_lost_refreshes(ctx, accounts, &mut probes, live)?;
+    remember(ctx, &probes)?;
+    Ok(probes)
 }
 
 /// Which stashed account each provider's live slot holds.
@@ -2648,6 +2696,73 @@ mod tests {
             .expect("grants");
         assert_eq!((grant.slug.as_str(), grant.token.as_str()), ("b", "access-r-b"));
         assert_eq!(grant.email, "b@example.com");
+    }
+
+    #[test]
+    fn the_desk_serves_the_accounts_in_use_then_the_pool_then_routed_accounts_once_each() {
+        use crate::routing::{Routing, Rule};
+        let mut fixture = desk_fixture("desk-served", Some("b"), &["c", "b"]);
+        fixture.stash.save("d", &stashed("d", oauth("r-d", LATER)).account).expect("stash");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("g", &g.account).expect("stash");
+        fixture.stash.set_active(Provider::Codex, "g").expect("active");
+        fixture.pool.push("gone".into());
+        Routing {
+            rules: vec![Rule {
+                provider: Provider::Claude,
+                model: "claude-opus-*".into(),
+                accounts: vec!["a".into(), "c".into()],
+            }],
+        }
+        .write(fixture.stash.root())
+        .unwrap();
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        let accounts = ctx.stash.list().expect("list");
+        let live = desk.live(&accounts).expect("live");
+
+        let served = desk.served(&accounts, &live).expect("served");
+
+        let slugs: Vec<&str> = served.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(slugs, ["b", "g", "c", "a"]);
+    }
+
+    #[test]
+    fn a_standing_that_could_not_be_read_keeps_the_last_reading_and_says_so() {
+        let fixture = Fixture::new("standing-unread");
+        let a = stashed("a_at_x.com", oauth("r-a", LATER));
+        let good = Probe {
+            slug: a.slug.clone(),
+            refreshed: None,
+            usage: Ok(vec![limit!("session", 12.0), limit!("weekly_all", 40.0)].into()),
+        };
+        remember(&fixture.ctx(), std::slice::from_ref(&good)).expect("records");
+        let failed = Probe { slug: a.slug.clone(), refreshed: None, usage: Err("429".into()) };
+        remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
+
+        let standing = reported(&fixture.ctx(), &a, &failed).expect("reports");
+
+        assert_eq!(standing.label, "a");
+        assert_eq!(standing.five_hour.map(|w| w.percent), Some(12.0));
+        assert_eq!(standing.weekly.map(|w| w.percent), Some(40.0));
+        assert_eq!(standing.read_at, fixture.reading(&a.slug).map(|r| r.polled_at));
+        assert_eq!(standing.error, Some(Unreadable::Unread));
+    }
+
+    #[test]
+    fn a_signed_out_account_stands_signed_out_with_no_windows() {
+        let fixture = Fixture::new("standing-signed-out");
+        let a = stashed("a_at_x.com", oauth("r-a", 0));
+        fixture.usage.record(&a.slug, &vec![limit!("session", 42.0)].into()).expect("records");
+        let gone = Probe { slug: a.slug.clone(), refreshed: None, usage: Err(Unread::SignedOut) };
+        remember(&fixture.ctx(), std::slice::from_ref(&gone)).expect("records");
+
+        let standing = reported(&fixture.ctx(), &a, &gone).expect("reports");
+
+        assert_eq!(standing.five_hour, None);
+        assert_eq!(standing.weekly, None);
+        assert!(standing.read_at.is_some());
+        assert_eq!(standing.error, Some(Unreadable::SignedOut));
     }
 
     #[test]
